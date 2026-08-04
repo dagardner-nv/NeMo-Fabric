@@ -413,6 +413,7 @@ The following example streams one invocation and collects its terminal result:
 
 ```python
 import asyncio
+import tempfile
 
 from nemo_fabric import (
     EnvironmentConfig,
@@ -425,13 +426,17 @@ from nemo_fabric import (
 
 
 async def main() -> None:
+    artifacts_dir = tempfile.mkdtemp()
+    print(f"Artifacts will be stored in: {artifacts_dir}")
+
     config = FabricConfig(
         metadata=MetadataConfig(name="streaming-agent"),
         harness=HarnessConfig(adapter_id="nvidia.fabric.codex"),
         models={
             "default": ModelConfig(provider="openai", model="openai/gpt-5.4")
         },
-        environment=EnvironmentConfig(provider="local", workspace="."),
+        environment=EnvironmentConfig(
+            provider="local", workspace=".", artifacts=artifacts_dir),
     ).enable_relay()
 
     async with await Fabric().start_runtime(config, streaming=True) as runtime:
