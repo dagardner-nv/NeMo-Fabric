@@ -29,6 +29,7 @@ SPDX-License-Identifier: Apache-2.0 -->
 - [`models.HarnessConfig`](./nemo_fabric.models.md#class-harnessconfig): Harness adapter selection plus adapter-owned settings.
 - [`models.InstructionConfig`](./nemo_fabric.models.md#class-instructionconfig): One portable instruction value.
 - [`models.InstructionsConfig`](./nemo_fabric.models.md#class-instructionsconfig): Harness-neutral agent instructions.
+- [`models.McpAuthenticationConfig`](./nemo_fabric.models.md#class-mcpauthenticationconfig): MCP server authentication configuration.
 - [`models.McpConfig`](./nemo_fabric.models.md#class-mcpconfig): MCP capability configuration.
 - [`models.McpServerConfig`](./nemo_fabric.models.md#class-mcpserverconfig): MCP server configuration.
 - [`models.MetadataConfig`](./nemo_fabric.models.md#class-metadataconfig): Human-readable agent identity.
@@ -49,7 +50,10 @@ SPDX-License-Identifier: Apache-2.0 -->
 - [`models.SkillConfig`](./nemo_fabric.models.md#class-skillconfig): Skill capability configuration.
 - [`models.TelemetryConfig`](./nemo_fabric.models.md#class-telemetryconfig): Telemetry configuration.
 - [`models.TelemetryProviderConfig`](./nemo_fabric.models.md#class-telemetryproviderconfig): Provider-specific telemetry configuration.
+- [`models.ToolDefinitionConfig`](./nemo_fabric.models.md#class-tooldefinitionconfig): One named normalized tool or tool-group definition.
 - [`models.ToolsConfig`](./nemo_fabric.models.md#class-toolsconfig): Harness-neutral tool capability configuration.
+- [`models.WorkflowConfig`](./nemo_fabric.models.md#class-workflowconfig): Adapter-owned workflow selection and immutable construction settings.
+- [`models.WorkflowEntrypointConfig`](./nemo_fabric.models.md#class-workflowentrypointconfig): Adapter-owned workflow entry point.
 - [`types.AdapterInfo`](./nemo_fabric.types.md#class-adapterinfo): Resolved adapter identity attached to a run plan.
 - [`types.ArtifactManifest`](./nemo_fabric.types.md#class-artifactmanifest): Normalized collection of artifacts produced by a run.
 - [`types.ArtifactRef`](./nemo_fabric.types.md#class-artifactref): Reference to one artifact produced by a run.

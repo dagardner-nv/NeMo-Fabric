@@ -15,6 +15,7 @@ import nemo_fabric
 import nemo_fabric.errors as fabric_errors
 import pytest
 from nemo_fabric import AdapterInfo
+from nemo_fabric import ArtifactRef
 from nemo_fabric import DoctorReport
 from nemo_fabric import EnvironmentConfig
 from nemo_fabric import Fabric
@@ -28,7 +29,9 @@ from nemo_fabric import FabricStateError
 from nemo_fabric import HarnessConfig
 from nemo_fabric import InstructionConfig
 from nemo_fabric import InstructionsConfig
+from nemo_fabric import McpAuthenticationConfig
 from nemo_fabric import McpConfig
+from nemo_fabric import McpServerConfig
 from nemo_fabric import MetadataConfig
 from nemo_fabric import RelayAtifConfig
 from nemo_fabric import RelayAtofConfig
@@ -47,7 +50,10 @@ from nemo_fabric import RuntimeConfig
 from nemo_fabric import RuntimeHandle
 from nemo_fabric import SkillConfig
 from nemo_fabric import TelemetryConfig
+from nemo_fabric import ToolDefinitionConfig
 from nemo_fabric import ToolsConfig
+from nemo_fabric import WorkflowConfig
+from nemo_fabric import WorkflowEntrypointConfig
 from nemo_fabric.types import _FabricConfigSnapshot
 from nemo_fabric.types import _ToolsConfig
 from pydantic import ValidationError
@@ -123,6 +129,59 @@ def test_typed_config_validates_required_fields_and_preserves_extensions():
         )
 
 
+def test_typed_workflow_round_trips_through_config_and_plan_snapshot():
+    config = FabricConfig(
+        metadata=MetadataConfig(name="demo"),
+        harness=HarnessConfig(adapter_id="test.fabric.shim"),
+        workflow=WorkflowConfig(
+            entrypoint=WorkflowEntrypointConfig(
+                kind="workflow_registry",
+                ref="test_agent",
+                namespace="example",
+            ),
+            settings={"llm_name": "default"},
+            revision="v1",
+        ),
+    )
+
+    assert config.to_mapping()["workflow"] == {
+        "entrypoint": {
+            "kind": "workflow_registry",
+            "ref": "test_agent",
+            "namespace": "example",
+        },
+        "settings": {"llm_name": "default"},
+        "revision": "v1",
+    }
+
+    snapshot = _FabricConfigSnapshot.from_mapping(config.to_mapping())
+    assert snapshot.workflow.entrypoint.kind == "workflow_registry"
+    assert snapshot.workflow.entrypoint.ref == "test_agent"
+    assert snapshot.workflow.entrypoint.namespace == "example"
+    assert snapshot.workflow.settings == {"llm_name": "default"}
+    assert snapshot.workflow.revision == "v1"
+    assert snapshot.to_mapping()["workflow"] == config.to_mapping()["workflow"]
+
+    config.workflow.settings.clear()
+    workflow_mapping = config.to_mapping()["workflow"]
+    assert "settings" not in workflow_mapping
+    snapshot = _FabricConfigSnapshot.from_mapping(config.to_mapping())
+    assert snapshot.to_mapping()["workflow"] == workflow_mapping
+
+
+@pytest.mark.parametrize("field", ["kind", "ref"])
+def test_typed_workflow_rejects_blank_entrypoint_values(field: str):
+    values = {"kind": "workflow_registry", "ref": "test_agent", field: " "}
+
+    with pytest.raises(ValidationError):
+        WorkflowEntrypointConfig(**values)
+
+    raw = _plan()["config"]
+    raw["workflow"] = {"entrypoint": values}
+    with pytest.raises(FabricConfigError, match="workflow entrypoint"):
+        _FabricConfigSnapshot.from_mapping(raw)
+
+
 def test_typed_config_authoring_helpers_emit_schema_shape():
     config = FabricConfig(
         metadata=MetadataConfig(name="demo"),
@@ -140,13 +199,28 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
         "github",
         transport="streamable-http",
         url="${GITHUB_MCP_URL}",
+        args=["--read-only"],
+        authentication=McpAuthenticationConfig(
+            type="oauth2",
+            client_id="fabric-client",
+            scopes=["repo"],
+        ),
+        custom_headers={"X-Tenant": "fabric"},
         exposure="fabric_managed",
+        allowed_tools=["issues.read", "pull_requests.read"],
+        blocked_tools=["issues.delete"],
     )
     config.enable_relay(
         project="fabric-tests",
         output_dir="./artifacts/relay",
     )
     config.block_tools("browser", "shell", "browser")
+    config.add_tool_definition(
+        "email_phishing_analyzer",
+        kind="function",
+        ref="email_phishing_analyzer",
+        settings={"llm": "default"},
+    )
     assert config.tools is not None
     config.tools.enabled = ["terminal"]
 
@@ -154,8 +228,19 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
     assert isinstance(config.skills, SkillConfig)
     assert isinstance(config.telemetry, TelemetryConfig)
     assert isinstance(config.tools, ToolsConfig)
+    assert isinstance(
+        config.tools.definitions["email_phishing_analyzer"],
+        ToolDefinitionConfig,
+    )
 
     assert config.to_mapping()["tools"] == {
+        "definitions": {
+            "email_phishing_analyzer": {
+                "kind": "function",
+                "ref": "email_phishing_analyzer",
+                "settings": {"llm": "default"},
+            }
+        },
         "enabled": ["terminal"],
         "blocked": ["browser", "shell"],
     }
@@ -165,7 +250,16 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
             "github": {
                 "transport": "streamable-http",
                 "url": "${GITHUB_MCP_URL}",
+                "args": ["--read-only"],
+                "authentication": {
+                    "type": "oauth2",
+                    "client_id": "fabric-client",
+                    "scopes": ["repo"],
+                },
+                "custom_headers": {"X-Tenant": "fabric"},
                 "exposure": "fabric_managed",
+                "allowed_tools": ["issues.read", "pull_requests.read"],
+                "blocked_tools": ["issues.delete"],
             }
         }
     }
@@ -194,6 +288,284 @@ def test_typed_config_authoring_helpers_emit_schema_shape():
         )
     with pytest.raises(ValidationError, match="providers"):
         TelemetryConfig(providers={"sideways": {}})
+
+
+def test_remove_last_tool_definition_preserves_tools_extensions():
+    config = FabricConfig(
+        metadata=MetadataConfig(name="demo"),
+        harness=HarnessConfig(adapter_id="test.fabric.shim"),
+        tools=ToolsConfig(
+            definitions={
+                "web": ToolDefinitionConfig(kind="function_group", ref="web_tools")
+            },
+            profile="strict",
+        ),
+    )
+
+    config.remove_tool_definition("web")
+
+    assert config.to_mapping()["tools"] == {"profile": "strict"}
+
+
+def test_mcp_server_tool_policy_preserves_empty_allowlist():
+    server = McpServerConfig(
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        allowed_tools=[],
+    )
+
+    expected = {
+        "transport": "streamable-http",
+        "url": "https://mcp.example.test",
+        "exposure": "harness_native",
+        "allowed_tools": [],
+    }
+    assert server.model_dump(mode="python") == expected
+    assert McpConfig(servers={"docs": server}).model_dump(mode="python") == {
+        "servers": {"docs": expected}
+    }
+    assert server.to_mapping() == expected
+
+
+def test_mcp_server_rejects_unknown_transport():
+    with pytest.raises(ValidationError, match="transport"):
+        McpServerConfig(transport="websocket", url="https://mcp.example.test")
+
+    server = McpServerConfig(
+        transport="streamable-http", url="https://mcp.example.test"
+    )
+    with pytest.raises(ValidationError, match="transport"):
+        server.transport = "websocket"  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize("transport", ["sse", "streamable-http"])
+def test_mcp_server_rejects_env_for_http_transport(transport):
+    with pytest.raises(ValidationError, match="env is only valid for stdio transport"):
+        McpServerConfig(
+            transport=transport,
+            url="https://mcp.example.test",
+            env={"MCP_SECRET": "secret"},
+        )
+
+
+def test_mcp_server_serializes_oauth2_authentication_and_custom_headers():
+    server = McpServerConfig(
+        transport="streamable-http",
+        url="https://mcp.example.test/jira",
+        custom_headers={"X-Tenant": "fabric"},
+        authentication={
+            "type": "oauth2",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "scopes": ["read:jira", "write:jira"],
+            "redirect_uri": "http://127.0.0.1:8765/callback",
+            "enable_dynamic_registration": False,
+            "client_name": "NeMo Fabric",
+            "token_endpoint_auth_method": "client_secret_post",
+            "authorization_timeout_seconds": 120,
+        },
+    )
+
+    assert isinstance(server.authentication, McpAuthenticationConfig)
+    assert server.custom_headers == {"X-Tenant": "fabric"}
+    assert "custom_headers" not in server.extra_fields
+    assert server.to_mapping() == {
+        "transport": "streamable-http",
+        "url": "https://mcp.example.test/jira",
+        "authentication": {
+            "type": "oauth2",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "scopes": ["read:jira", "write:jira"],
+            "redirect_uri": "http://127.0.0.1:8765/callback",
+            "enable_dynamic_registration": False,
+            "client_name": "NeMo Fabric",
+            "token_endpoint_auth_method": "client_secret_post",
+            "authorization_timeout_seconds": 120,
+        },
+        "custom_headers": {"X-Tenant": "fabric"},
+        "exposure": "harness_native",
+    }
+
+
+def test_mcp_server_serializes_service_account_authentication():
+    server = McpServerConfig(
+        transport="streamable-http",
+        url="https://mcp.example.test/automation",
+        authentication=McpAuthenticationConfig(
+            type="service_account",
+            client_id="fabric-client",
+            client_secret_env="MCP_CLIENT_SECRET",
+            token_url="https://auth.example.test/token",
+            scopes=["mcp:invoke"],
+            token_endpoint_auth_method="client_secret_basic",
+            token_cache_buffer_seconds=60,
+        ),
+    )
+
+    assert server.to_mapping()["authentication"] == {
+        "type": "service_account",
+        "client_id": "fabric-client",
+        "client_secret_env": "MCP_CLIENT_SECRET",
+        "token_url": "https://auth.example.test/token",
+        "scopes": ["mcp:invoke"],
+        "token_endpoint_auth_method": "client_secret_basic",
+        "token_cache_buffer_seconds": 60,
+    }
+
+
+def test_mcp_oauth_allows_dynamic_registration_to_supply_client_secret():
+    authentication = McpAuthenticationConfig(
+        type="oauth2",
+        token_endpoint_auth_method="client_secret_post",
+    )
+
+    assert authentication.client_id is None
+    assert authentication.client_secret_env is None
+    assert authentication.enable_dynamic_registration is True
+
+
+@pytest.mark.parametrize(
+    "authentication",
+    [
+        {"type": "oauth2", "enable_dynamic_registration": False},
+        {
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+        },
+        {
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "token_url": "https://auth.example.test/token",
+            "token_endpoint_auth_method": "none",
+        },
+    ],
+)
+def test_mcp_authentication_rejects_invalid_policy(authentication):
+    with pytest.raises(ValidationError):
+        McpAuthenticationConfig.model_validate(authentication)
+
+
+@pytest.mark.parametrize(
+    "authentication",
+    [
+        {"type": "oauth2", "unknown": True},
+        {
+            "type": "service_account",
+            "client_id": "fabric-client",
+            "client_secret_env": "MCP_CLIENT_SECRET",
+            "token_url": "https://auth.example.test/token",
+            "unknown": True,
+        },
+    ],
+)
+def test_mcp_authentication_rejects_unknown_variant_fields(authentication):
+    with pytest.raises(ValidationError, match="unknown"):
+        McpAuthenticationConfig(**authentication)
+
+
+@pytest.mark.parametrize(
+    ("authentication_type", "field", "value"),
+    [
+        ("oauth2", "token_url", None),
+        ("oauth2", "token_cache_buffer_seconds", 300),
+        ("service_account", "redirect_uri", None),
+        ("service_account", "enable_dynamic_registration", True),
+        ("service_account", "client_name", None),
+        ("service_account", "authorization_timeout_seconds", 300),
+    ],
+)
+def test_mcp_authentication_rejects_explicit_cross_variant_fields(
+    authentication_type, field, value
+):
+    authentication = {"type": authentication_type, field: value}
+    if authentication_type == "service_account":
+        authentication.update(
+            {
+                "client_id": "fabric-client",
+                "client_secret_env": "MCP_CLIENT_SECRET",
+                "token_url": "https://auth.example.test/token",
+            }
+        )
+
+    with pytest.raises(ValidationError, match=field):
+        McpAuthenticationConfig(**authentication)
+
+
+def test_mcp_config_add_server_preserves_legacy_mcp_extra_fields():
+    config = McpConfig().add_server(
+        "docs",
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        extra_fields={
+            "authentication": {"type": "oauth2"},
+            "custom_headers": {"X-Tenant": "fabric"},
+        },
+    )
+
+    assert config.to_mapping()["servers"]["docs"]["authentication"] == {
+        "type": "oauth2"
+    }
+    assert config.to_mapping()["servers"]["docs"]["custom_headers"] == {
+        "X-Tenant": "fabric"
+    }
+
+
+def test_mcp_config_add_server_accepts_custom_headers():
+    config = McpConfig().add_server(
+        "docs",
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        custom_headers={"X-Tenant": "fabric"},
+    )
+
+    assert config.servers["docs"].custom_headers == {"X-Tenant": "fabric"}
+    assert config.to_mapping()["servers"]["docs"]["custom_headers"] == {
+        "X-Tenant": "fabric"
+    }
+
+
+def test_mcp_authentication_rejects_unsupported_type():
+    with pytest.raises(ValidationError, match="oauth2"):
+        McpAuthenticationConfig(type="bearer")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["allowed_tools", "blocked_tools"])
+def test_mcp_config_rejects_string_tool_policy(field: str):
+    with pytest.raises(
+        TypeError,
+        match=rf"{field} must be a sequence of strings, not a string",
+    ):
+        McpConfig().add_server(
+            "docs",
+            transport="streamable-http",
+            url="https://mcp.example.test",
+            **{field: "search"},  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    ("allowed_tools", "blocked_tools", "message"),
+    [
+        (["search"], ["search"], "cannot be both allowed and blocked"),
+        ([""], [], "MCP tool names must not be empty"),
+        (None, ["  "], "MCP tool names must not be empty"),
+    ],
+)
+def test_mcp_server_tool_policy_rejects_invalid_names_and_overlap(
+    allowed_tools: list[str] | None,
+    blocked_tools: list[str],
+    message: str,
+):
+    with pytest.raises(ValidationError, match=message):
+        McpServerConfig(
+            transport="streamable-http",
+            url="https://mcp.example.test",
+            allowed_tools=allowed_tools,
+            blocked_tools=blocked_tools,
+        )
 
 
 def test_typed_tools_config_serializes_blocked_policy():
@@ -286,6 +658,44 @@ def test_run_plan_config_block_tools_emits_canonical_shape():
     assert config.to_mapping()["tools"] == {"blocked": ["browser", "shell"]}
 
 
+def test_run_plan_config_add_mcp_server_emits_tool_filters():
+    config = _FabricConfigSnapshot.from_mapping(_plan()["config"])
+
+    config.add_mcp_server(
+        "docs",
+        transport="streamable-http",
+        url="https://mcp.example.test",
+        authentication={"type": "oauth2"},
+        allowed_tools=["search"],
+        blocked_tools=["delete"],
+    )
+
+    assert config.to_mapping()["mcp"]["servers"]["docs"] == {
+        "transport": "streamable-http",
+        "url": "https://mcp.example.test",
+        "exposure": "harness_native",
+        "authentication": {"type": "oauth2"},
+        "allowed_tools": ["search"],
+        "blocked_tools": ["delete"],
+    }
+
+
+@pytest.mark.parametrize(
+    "reserved_field",
+    ["transport", "url", "exposure", "allowed_tools", "blocked_tools"],
+)
+def test_run_plan_config_rejects_reserved_mcp_extra_field(reserved_field: str):
+    config = _FabricConfigSnapshot.from_mapping(_plan()["config"])
+
+    with pytest.raises(FabricConfigError, match="reserved field"):
+        config.add_mcp_server(
+            "docs",
+            transport="streamable-http",
+            url="https://mcp.example.test",
+            extra_fields={reserved_field: "override"},
+        )
+
+
 def test_run_plan_config_preserves_normalized_tools_and_execution_fields():
     raw = _plan()["config"]
     raw.update(
@@ -314,6 +724,91 @@ def test_run_plan_config_preserves_normalized_tools_and_execution_fields():
 def test_run_plan_tools_config_rejects_scalar_blocked_value():
     with pytest.raises(FabricConfigError, match="tools blocked"):
         _ToolsConfig(blocked="browser")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("definitions", [[], [{"kind": "function", "ref": "web"}]])
+def test_run_plan_tools_config_rejects_non_mapping_definitions(definitions: object):
+    with pytest.raises(FabricConfigError, match="tool definitions must be a JSON object"):
+        _ToolsConfig(definitions=definitions)  # type: ignore[arg-type]
+
+
+def test_run_plan_tools_config_preserves_named_definitions():
+    config = _ToolsConfig().add_definition(
+        "web",
+        kind="function_group",
+        ref="web_tools",
+        settings={"include": ["search"]},
+    )
+
+    assert config.to_mapping() == {
+        "definitions": {
+            "web": {
+                "kind": "function_group",
+                "ref": "web_tools",
+                "settings": {"include": ["search"]},
+            }
+        }
+    }
+
+
+def test_typed_tool_definition_omits_empty_settings():
+    definition = ToolDefinitionConfig(kind="function_group", ref="web_tools")
+
+    assert definition.model_dump() == {
+        "kind": "function_group",
+        "ref": "web_tools",
+    }
+
+
+def test_run_plan_snapshot_removes_named_definition():
+    config = _FabricConfigSnapshot.from_mapping(
+        {
+            "schema_version": "fabric.agent/v1alpha1",
+            "metadata": {"name": "demo"},
+            "harness": {"adapter_id": "test.fabric.shim"},
+            "tools": {
+                "definitions": {
+                    "web": {"kind": "function_group", "ref": "web_tools"}
+                }
+            },
+        }
+    )
+
+    config.remove_tool_definition("web")
+
+    assert "definitions" not in config.to_mapping()["tools"]
+
+
+def test_run_plan_snapshot_remove_definition_preserves_absent_tools():
+    config = _FabricConfigSnapshot.from_mapping(
+        {
+            "schema_version": "fabric.agent/v1alpha1",
+            "metadata": {"name": "demo"},
+            "harness": {"adapter_id": "test.fabric.shim"},
+        }
+    )
+
+    config.remove_tool_definition("web")
+
+    assert "tools" not in config.to_mapping()
+
+
+def test_artifact_ref_omits_empty_metadata_and_preserves_values():
+    assert ArtifactRef.from_mapping(
+        {"name": "trace", "kind": "file", "path": "trace.jsonl"}
+    ).to_mapping() == {
+        "name": "trace",
+        "kind": "file",
+        "path": "trace.jsonl",
+    }
+    assert ArtifactRef.from_mapping(
+        {
+            "name": "trace",
+            "kind": "file",
+            "path": "trace.jsonl",
+            "metadata": {"rows": 10},
+        }
+    ).to_mapping()["metadata"] == {"rows": 10}
 
 
 def test_fabric_config_authors_first_class_relay_observability():

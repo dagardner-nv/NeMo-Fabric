@@ -214,6 +214,80 @@ class _HarnessConfig(_ConfigMapping):
         )
 
 
+class _WorkflowEntrypointConfig(_ConfigMapping):
+    """Adapter-owned workflow entry point."""
+
+    _fields = frozenset({"kind", "ref"})
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        ref: str,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            {
+                "kind": _required_text(kind, "workflow entrypoint kind"),
+                "ref": _required_text(ref, "workflow entrypoint ref"),
+            },
+            extra_fields=extra_fields,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "_WorkflowEntrypointConfig":
+        """Validate a workflow entry-point mapping."""
+
+        data = _mapping(value, "workflow entrypoint")
+        return cls(
+            kind=data.get("kind"),
+            ref=data.get("ref"),
+            extra_fields={key: item for key, item in data.items() if key not in cls._fields},
+        )
+
+
+class _WorkflowConfig(_ConfigMapping):
+    """Adapter-owned workflow selection and construction settings."""
+
+    _fields = frozenset({"entrypoint", "settings"})
+    _omit_if_empty = frozenset({"settings"})
+
+    def __init__(
+        self,
+        *,
+        entrypoint: _WorkflowEntrypointConfig | Mapping[str, Any],
+        settings: Mapping[str, Any] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            {
+                "entrypoint": _coerce(
+                    _WorkflowEntrypointConfig,
+                    entrypoint,
+                    "workflow entrypoint",
+                ),
+                "settings": _mapping(
+                    {} if settings is None else settings,
+                    "workflow settings",
+                ),
+            },
+            extra_fields=extra_fields,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "_WorkflowConfig":
+        """Validate a workflow mapping."""
+
+        data = _mapping(value, "workflow")
+        if "entrypoint" not in data:
+            raise FabricConfigError("workflow entrypoint is required")
+        return cls(
+            entrypoint=data["entrypoint"],
+            settings=data.get("settings"),
+            extra_fields={key: item for key, item in data.items() if key not in cls._fields},
+        )
+
+
 class _InstructionConfig(_ConfigMapping):
     """One portable instruction value."""
 
@@ -463,15 +537,55 @@ class _SkillConfig(_ConfigMapping):
         return self
 
 
-class _ToolsConfig(_ConfigMapping):
-    """Harness-neutral tool capability configuration."""
+class _ToolDefinitionConfig(_ConfigMapping):
+    """One named normalized tool or tool-group definition."""
 
-    _fields = frozenset({"enabled", "blocked"})
-    _omit_if_empty = frozenset({"blocked"})
+    _fields = frozenset({"kind", "ref", "settings"})
+    _omit_if_empty = frozenset({"settings"})
 
     def __init__(
         self,
         *,
+        kind: str,
+        ref: str,
+        settings: Mapping[str, Any] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(
+            {
+                "kind": _required_text(kind, "tool definition kind"),
+                "ref": _required_text(ref, "tool definition ref"),
+                "settings": _mapping(
+                    {} if settings is None else settings,
+                    "tool definition settings",
+                ),
+            },
+            extra_fields=extra_fields,
+        )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> _ToolDefinitionConfig:
+        """Validate a tool definition and preserve extension fields."""
+
+        data = _mapping(value, "tool definition")
+        return cls(
+            kind=data.get("kind"),
+            ref=data.get("ref"),
+            settings=data.get("settings"),
+            extra_fields={key: item for key, item in data.items() if key not in cls._fields},
+        )
+
+
+class _ToolsConfig(_ConfigMapping):
+    """Harness-neutral tool capability configuration."""
+
+    _fields = frozenset({"definitions", "enabled", "blocked"})
+    _omit_if_empty = frozenset({"definitions", "blocked"})
+
+    def __init__(
+        self,
+        *,
+        definitions: Mapping[str, Any] | None = None,
         enabled: Sequence[str] | None = None,
         blocked: Sequence[str] | None = None,
         extra_fields: Mapping[str, Any] | None = None,
@@ -495,7 +609,22 @@ class _ToolsConfig(_ConfigMapping):
         if overlap:
             name = sorted(overlap)[0]
             raise FabricConfigError(f"tool {name!r} cannot be both enabled and blocked")
-        values: dict[str, Any] = {"blocked": blocked_values}
+        raw_definitions = _mapping(
+            {} if definitions is None else definitions,
+            "tool definitions",
+        )
+        definition_values = {
+            _required_text(name, "tool definition name"): _coerce(
+                _ToolDefinitionConfig,
+                definition,
+                f"tool definition {name}",
+            )
+            for name, definition in raw_definitions.items()
+        }
+        values: dict[str, Any] = {
+            "definitions": definition_values,
+            "blocked": blocked_values,
+        }
         if enabled_values is not None:
             values["enabled"] = enabled_values
         super().__init__(values, extra_fields=extra_fields)
@@ -506,6 +635,7 @@ class _ToolsConfig(_ConfigMapping):
 
         data = _mapping(value, "tools")
         return cls(
+            definitions=data.get("definitions"),
             enabled=data.get("enabled"),
             blocked=data.get("blocked", []),
             extra_fields={key: item for key, item in data.items() if key not in cls._fields},
@@ -522,6 +652,37 @@ class _ToolsConfig(_ConfigMapping):
         self["blocked"] = blocked
         return self
 
+    def add_definition(
+        self,
+        name: str,
+        *,
+        kind: str,
+        ref: str,
+        settings: Mapping[str, Any] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> _ToolsConfig:
+        """Add or replace one named definition."""
+
+        definitions = dict(self.get("definitions", {}))
+        definitions[_required_text(name, "tool definition name")] = (
+            _ToolDefinitionConfig(
+                kind=kind,
+                ref=ref,
+                settings=settings,
+                extra_fields=extra_fields,
+            )
+        )
+        self["definitions"] = definitions
+        return self
+
+    def remove_definition(self, name: str) -> _ToolsConfig:
+        """Remove one named definition."""
+
+        definitions = dict(self.get("definitions", {}))
+        definitions.pop(name, None)
+        self["definitions"] = definitions
+        return self
+
 
 class _McpConfig(_ConfigMapping):
     """MCP capability configuration with authoring helpers."""
@@ -529,6 +690,9 @@ class _McpConfig(_ConfigMapping):
     _fields = frozenset({"servers"})
     _omit_if_empty = frozenset({"servers"})
     _EXPOSURES = frozenset({"harness_native", "fabric_managed"})
+    _SERVER_FIELDS = frozenset(
+        {"transport", "url", "exposure", "allowed_tools", "blocked_tools"}
+    )
 
     def __init__(
         self,
@@ -555,7 +719,10 @@ class _McpConfig(_ConfigMapping):
         *,
         transport: str,
         url: str,
+        authentication: Mapping[str, Any] | None = None,
         exposure: str = "harness_native",
+        allowed_tools: Sequence[str] | None = None,
+        blocked_tools: Sequence[str] = (),
         extra_fields: Mapping[str, Any] | None = None,
     ) -> "_McpConfig":
         """Add or replace a named MCP server."""
@@ -563,17 +730,58 @@ class _McpConfig(_ConfigMapping):
         if exposure not in self._EXPOSURES:
             allowed = ", ".join(sorted(self._EXPOSURES))
             raise FabricConfigError(f"mcp exposure must be one of: {allowed}")
-        server = {
+        for policy, tools in (
+            ("allowed_tools", allowed_tools),
+            ("blocked_tools", blocked_tools),
+        ):
+            if tools is not None and (
+                isinstance(tools, (str, bytes)) or not isinstance(tools, Sequence)
+            ):
+                raise FabricConfigError(
+                    f"mcp {policy} must be an ordered sequence of strings"
+                )
+        allowed_values = (
+            None
+            if allowed_tools is None
+            else [_required_text(tool, "allowed MCP tool") for tool in allowed_tools]
+        )
+        blocked_values = [
+            _required_text(tool, "blocked MCP tool") for tool in blocked_tools
+        ]
+        overlap = set(allowed_values or []).intersection(blocked_values)
+        if overlap:
+            tool = sorted(overlap)[0]
+            raise FabricConfigError(
+                f"MCP tool {tool!r} cannot be both allowed and blocked"
+            )
+        server: dict[str, Any] = {
             "transport": _required_text(transport, "mcp transport"),
             "url": _required_text(url, "mcp url"),
             "exposure": exposure,
         }
-        server.update(
-            _mapping(
-                {} if extra_fields is None else extra_fields,
-                "mcp server extra_fields",
-            )
+        if allowed_values is not None:
+            server["allowed_tools"] = allowed_values
+        if blocked_values:
+            server["blocked_tools"] = blocked_values
+        extensions = _mapping(
+            {} if extra_fields is None else extra_fields,
+            "mcp server extra_fields",
         )
+        legacy_authentication = extensions.pop("authentication", None)
+        reserved = self._SERVER_FIELDS.intersection(extensions)
+        if reserved:
+            field = sorted(reserved)[0]
+            raise FabricConfigError(
+                f"mcp server extra_fields must not contain reserved field {field!r}"
+            )
+        authentication_value = (
+            authentication if authentication is not None else legacy_authentication
+        )
+        if authentication_value is not None:
+            server["authentication"] = _mapping(
+                authentication_value, "mcp server authentication"
+            )
+        server.update(extensions)
         servers = dict(self.get("servers", {}))
         servers[_required_text(name, "mcp server name")] = server
         self["servers"] = servers
@@ -673,6 +881,7 @@ class _FabricConfigSnapshot(_ConfigMapping):
         schema_version: Agent schema identifier.
         metadata: Required ``MetadataConfig`` agent identity.
         harness: Required ``HarnessConfig`` adapter selection.
+        workflow: Optional adapter-owned workflow selection and construction settings.
         runtime: Invocation runtime configuration.
         environment: Optional execution environment configuration.
         models: Named, JSON-compatible model configurations.
@@ -690,6 +899,7 @@ class _FabricConfigSnapshot(_ConfigMapping):
             "schema_version",
             "metadata",
             "harness",
+            "workflow",
             "runtime",
             "environment",
             "models",
@@ -708,6 +918,7 @@ class _FabricConfigSnapshot(_ConfigMapping):
         *,
         metadata: _MetadataConfig | Mapping[str, Any],
         harness: _HarnessConfig | Mapping[str, Any],
+        workflow: _WorkflowConfig | Mapping[str, Any] | None = None,
         runtime: _RuntimeConfig | Mapping[str, Any] | None = None,
         schema_version: str = "fabric.agent/v1alpha1",
         environment: _EnvironmentConfig | Mapping[str, Any] | None = None,
@@ -722,6 +933,9 @@ class _FabricConfigSnapshot(_ConfigMapping):
     ) -> None:
         metadata_value = _coerce(_MetadataConfig, metadata, "metadata")
         harness_value = _coerce(_HarnessConfig, harness, "harness")
+        workflow_value = (
+            None if workflow is None else _coerce(_WorkflowConfig, workflow, "workflow")
+        )
         runtime_value = _coerce(
             _RuntimeConfig,
             _RuntimeConfig() if runtime is None else runtime,
@@ -747,6 +961,7 @@ class _FabricConfigSnapshot(_ConfigMapping):
         }
         for key, item in (
             ("environment", environment_value),
+            ("workflow", workflow_value),
             ("instructions", instructions_value),
             ("mcp", mcp_value),
             ("skills", skills_value),
@@ -776,6 +991,7 @@ class _FabricConfigSnapshot(_ConfigMapping):
             schema_version=data.get("schema_version", "fabric.agent/v1alpha1"),
             metadata=data["metadata"],
             harness=data["harness"],
+            workflow=data.get("workflow"),
             runtime=data.get("runtime"),
             environment=data.get("environment"),
             models=data.get("models"),
@@ -844,16 +1060,22 @@ class _FabricConfigSnapshot(_ConfigMapping):
         *,
         transport: str,
         url: str,
+        authentication: Mapping[str, Any] | None = None,
         exposure: str = "harness_native",
+        allowed_tools: Sequence[str] | None = None,
+        blocked_tools: Sequence[str] = (),
         extra_fields: Mapping[str, Any] | None = None,
-    ) -> "_FabricConfigSnapshot":
+    ) -> _FabricConfigSnapshot:
         """Add or replace a named MCP server and return this config."""
 
         self.mcp.add_server(
             name,
             transport=transport,
             url=url,
+            authentication=authentication,
             exposure=exposure,
+            allowed_tools=allowed_tools,
+            blocked_tools=blocked_tools,
             extra_fields=extra_fields,
         )
         return self
@@ -868,6 +1090,36 @@ class _FabricConfigSnapshot(_ConfigMapping):
         """Block adapter-native tool names and return this config."""
 
         self.tools.block(*tools)
+        return self
+
+    def add_tool_definition(
+        self,
+        name: str,
+        *,
+        kind: str,
+        ref: str,
+        settings: Mapping[str, Any] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> _FabricConfigSnapshot:
+        """Add or replace one named tool definition and return this config."""
+
+        self.tools.add_definition(
+            name,
+            kind=kind,
+            ref=ref,
+            settings=settings,
+            extra_fields=extra_fields,
+        )
+        return self
+
+    def remove_tool_definition(self, name: str) -> _FabricConfigSnapshot:
+        """Remove one named tool definition and return this config."""
+
+        tools = self.get("tools")
+        if tools is not None:
+            if not isinstance(tools, _ToolsConfig):
+                raise FabricConfigError("tools must be a _ToolsConfig")
+            tools.remove_definition(name)
         return self
 
     def enable_relay(
@@ -1183,6 +1435,7 @@ class ArtifactRef(FabricMapping):
     metadata: Mapping[str, Any]
     _fields = frozenset({"name", "kind", "path", "media_type", "metadata"})
     _json_fields = frozenset({"metadata"})
+    _omit_if_empty = frozenset({"metadata"})
 
     @classmethod
     def _normalize(cls, data: dict[str, Any]) -> dict[str, Any]:

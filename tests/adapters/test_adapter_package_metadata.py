@@ -50,9 +50,7 @@ ADAPTER_EXTRAS = {
             f"nemo-fabric-adapters-hermes[harness] == {PACKAGE_VERSION}; "
             "python_version < '3.14'"
         ),
-        "harness": [
-            "hermes-agent>=0.17.0; python_version < '3.14'"
-        ],
+        "harness": ["hermes-agent[mcp]>=0.19.0; python_version < '3.14'"],
         "relay": ["nemo-relay>=0.6.0,<0.7"],
     },
 }
@@ -61,10 +59,12 @@ ADAPTER_EXTRAS = {
 @pytest.mark.parametrize(
     ("path", "expected"),
     [
+        ("adapter-contract", []),
         ("adapters/common", []),
         (
             "adapters/claude",
             [
+                f"nemo-fabric-adapter-contract == {PACKAGE_VERSION}",
                 f"nemo-fabric-adapters-common == {PACKAGE_VERSION}",
                 "tomli-w~=1.2",
             ],
@@ -72,6 +72,7 @@ ADAPTER_EXTRAS = {
         (
             "adapters/codex",
             [
+                f"nemo-fabric-adapter-contract == {PACKAGE_VERSION}",
                 f"nemo-fabric-adapters-common == {PACKAGE_VERSION}",
                 "tomli-w~=1.2",
             ],
@@ -79,6 +80,7 @@ ADAPTER_EXTRAS = {
         (
             "adapters/deepagents",
             [
+                f"nemo-fabric-adapter-contract == {PACKAGE_VERSION}",
                 f"nemo-fabric-adapters-common == {PACKAGE_VERSION}",
                 "langchain-mcp-adapters>=0.1,<0.3.0",
                 "langchain-openai>=0.3",
@@ -87,7 +89,10 @@ ADAPTER_EXTRAS = {
         ),
         (
             "adapters/hermes",
-            [f"nemo-fabric-adapters-common == {PACKAGE_VERSION}"],
+            [
+                f"nemo-fabric-adapter-contract == {PACKAGE_VERSION}",
+                f"nemo-fabric-adapters-common == {PACKAGE_VERSION}",
+            ],
         ),
     ],
 )
@@ -95,6 +100,12 @@ def test_adapter_runtime_dependencies(path: str, expected: list[str]):
     project = load_pyproject(path)["project"]
     assert project["version"] == PACKAGE_VERSION
     assert sorted(project.get("dependencies", [])) == sorted(expected)
+
+
+def test_adapter_contract_offers_optional_pydantic_interop():
+    extras = load_pyproject("adapter-contract")["project"]["optional-dependencies"]
+
+    assert extras == {"pydantic": ["pydantic>=2.12,<3"]}
 
 
 def test_adapter_test_dependency_group_matches_leaf_harnesses():

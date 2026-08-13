@@ -24,7 +24,9 @@ from typing import Self
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from pydantic import SerializerFunctionWrapHandler
 from pydantic import field_validator
+from pydantic import model_serializer
 from pydantic import model_validator
 
 
@@ -102,7 +104,40 @@ class HarnessConfig(FabricBaseModel):
         ]
         | None
     ) = None
+    settings: dict[str, Any] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+
+
+class WorkflowEntrypointConfig(FabricBaseModel):
+    """Adapter-owned workflow entry point."""
+
+    kind: str = Field(min_length=1, pattern=r"\S")
+    ref: str = Field(min_length=1, pattern=r"\S")
+
+    @field_validator("kind", "ref")
+    @classmethod
+    def _validate_nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("workflow entrypoint values must be non-empty strings")
+        return value
+
+
+class WorkflowConfig(FabricBaseModel):
+    """Adapter-owned workflow selection and immutable construction settings."""
+
+    entrypoint: WorkflowEntrypointConfig
     settings: dict[str, Any] = Field(default_factory=dict)
+
+    @model_serializer(mode="wrap")
+    def _serialize_workflow(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if not self.settings:
+            data.pop("settings", None)
+        return data
 
 
 class InstructionConfig(FabricBaseModel):
@@ -257,12 +292,202 @@ class SkillConfig(FabricBaseModel):
         return self
 
 
+class McpAuthenticationConfig(FabricBaseModel):
+    """MCP server authentication configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["oauth2", "service_account"]
+    client_id: str | None = None
+    client_secret_env: str | None = None
+    scopes: list[str] = Field(
+        default_factory=list, exclude_if=lambda value: not value
+    )
+    redirect_uri: str | None = None
+    enable_dynamic_registration: bool = Field(
+        default=True, exclude_if=lambda value: value
+    )
+    client_name: str | None = None
+    token_endpoint_auth_method: (
+        Literal["none", "client_secret_post", "client_secret_basic"] | None
+    ) = None
+    authorization_timeout_seconds: int = Field(
+        default=300, gt=0, exclude_if=lambda value: value == 300
+    )
+    token_url: str | None = None
+    token_cache_buffer_seconds: int = Field(
+        default=300, ge=0, exclude_if=lambda value: value == 300
+    )
+
+    @field_validator(
+        "client_id",
+        "client_secret_env",
+        "redirect_uri",
+        "client_name",
+        "token_url",
+    )
+    @classmethod
+    def _validate_optional_nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("authentication values must not be empty")
+        return value
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, value: list[str]) -> list[str]:
+        if any(not scope.strip() for scope in value):
+            raise ValueError("authentication scopes must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_authentication_type(self) -> Self:
+        if self.type == "oauth2":
+            service_account_fields = self.model_fields_set.intersection(
+                {"token_url", "token_cache_buffer_seconds"}
+            )
+            if service_account_fields:
+                name = sorted(service_account_fields)[0]
+                raise ValueError(
+                    f"{name} is only valid for service_account authentication"
+                )
+            if self.client_secret_env and not self.client_id:
+                raise ValueError("client_secret_env requires client_id")
+            if not self.client_id and not self.enable_dynamic_registration:
+                raise ValueError(
+                    "oauth2 authentication requires client_id when dynamic registration is disabled"
+                )
+            if (
+                self.token_endpoint_auth_method
+                in {
+                    "client_secret_basic",
+                    "client_secret_post",
+                }
+                and self.client_id is not None
+                and not self.client_secret_env
+            ):
+                raise ValueError(
+                    "token_endpoint_auth_method requires client_secret_env for a pre-registered client"
+                )
+            if (
+                self.token_endpoint_auth_method == "none"
+                and self.client_secret_env is not None
+            ):
+                raise ValueError(
+                    "token_endpoint_auth_method 'none' cannot use client_secret_env"
+                )
+            return self
+
+        oauth2_fields = self.model_fields_set.intersection(
+            {
+                "redirect_uri",
+                "enable_dynamic_registration",
+                "client_name",
+                "authorization_timeout_seconds",
+            }
+        )
+        if oauth2_fields:
+            name = sorted(oauth2_fields)[0]
+            raise ValueError(f"{name} is only valid for oauth2 authentication")
+        missing = [
+            name
+            for name, value in (
+                ("client_id", self.client_id),
+                ("client_secret_env", self.client_secret_env),
+                ("token_url", self.token_url),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "service_account authentication requires " + ", ".join(missing)
+            )
+        if self.token_endpoint_auth_method == "none":
+            raise ValueError(
+                "service_account authentication requires client_secret_basic or client_secret_post"
+            )
+        return self
+
+
 class McpServerConfig(FabricBaseModel):
     """MCP server configuration."""
 
-    transport: str = Field(min_length=1)
-    url: str = Field(min_length=1)
+    transport: Literal["stdio", "sse", "streamable-http"]
+    url: str = Field(
+        min_length=1,
+        description=(
+            "MCP server URL for network transports or executable for stdio."
+        ),
+    )
+    args: list[str] = Field(
+        default_factory=list,
+        exclude_if=lambda value: not value,
+        description="Command-line arguments passed to an MCP stdio server process.",
+    )
+    env: dict[str, str] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+        description="Environment variables passed to an MCP stdio server process.",
+    )
+    authentication: McpAuthenticationConfig | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    custom_headers: dict[str, str] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+        description=(
+            "HTTP headers passed to an MCP server when transport is sse or "
+            "streamable-http."
+        ),
+    )
     exposure: Literal["harness_native", "fabric_managed"] = "harness_native"
+    allowed_tools: list[str] | None = Field(
+        default=None,
+        description=(
+            "MCP tools to expose. None exposes every discovered tool; an empty "
+            "list exposes no tools."
+        ),
+    )
+    blocked_tools: list[str] = Field(
+        default_factory=list,
+        description="MCP tools to block after applying the optional allowlist.",
+    )
+
+    @model_serializer(mode="wrap")
+    def _serialize_tool_policy(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        data = handler(self)
+        if self.allowed_tools is None:
+            data.pop("allowed_tools", None)
+        if not self.blocked_tools:
+            data.pop("blocked_tools", None)
+        return data
+
+    @field_validator("allowed_tools", "blocked_tools")
+    @classmethod
+    def _validate_tool_names(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and any(not tool.strip() for tool in value):
+            raise ValueError("MCP tool names must not be empty")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_tool_policy(self) -> Self:
+        if self.transport != "stdio" and self.env:
+            raise ValueError("env is only valid for stdio transport")
+        if self.allowed_tools is not None:
+            overlap = set(self.allowed_tools).intersection(self.blocked_tools)
+            if overlap:
+                name = sorted(overlap)[0]
+                raise ValueError(f"MCP tool {name!r} cannot be both allowed and blocked")
+        return self
+
+    def to_mapping(self) -> dict[str, Any]:
+        """Return the server mapping without collapsing an explicit empty allowlist."""
+
+        data = super().to_mapping()
+        if self.allowed_tools == []:
+            data["allowed_tools"] = []
+        return data
 
 
 class McpConfig(FabricBaseModel):
@@ -276,16 +501,48 @@ class McpConfig(FabricBaseModel):
         *,
         transport: str,
         url: str,
+        args: Sequence[str] | None = None,
+        env: Mapping[str, str] | None = None,
+        authentication: McpAuthenticationConfig | None = None,
+        custom_headers: Mapping[str, str] | None = None,
         exposure: Literal["harness_native", "fabric_managed"] = "harness_native",
+        allowed_tools: Sequence[str] | None = None,
+        blocked_tools: Sequence[str] = (),
         extra_fields: Mapping[str, Any] | None = None,
     ) -> Self:
-        """Add or replace a named MCP server."""
+        """Add or replace a named MCP server.
+
+        For stdio, set ``url`` to the executable and pass each command-line
+        argument as a separate ``args`` element.
+        """
+
+        extensions = dict(extra_fields or {})
+        legacy_args = extensions.pop("args", ())
+        legacy_env = extensions.pop("env", None)
+        legacy_authentication = extensions.pop("authentication", None)
+        legacy_custom_headers = extensions.pop("custom_headers", None)
+        if isinstance(allowed_tools, str):
+            raise TypeError("allowed_tools must be a sequence of strings, not a string")
+        if isinstance(blocked_tools, str):
+            raise TypeError("blocked_tools must be a sequence of strings, not a string")
 
         self.servers[name] = McpServerConfig(
             transport=transport,
             url=url,
+            args=list(args if args is not None else legacy_args),
+            env=env if env is not None else legacy_env or {},
+            authentication=(
+                authentication if authentication is not None else legacy_authentication
+            ),
+            custom_headers=(
+                custom_headers
+                if custom_headers is not None
+                else legacy_custom_headers or {}
+            ),
             exposure=exposure,
-            **dict(extra_fields or {}),
+            allowed_tools=None if allowed_tools is None else list(allowed_tools),
+            blocked_tools=list(blocked_tools),
+            **extensions,
         )
         return self
 
@@ -478,8 +735,32 @@ class TelemetryConfig(FabricBaseModel):
         return self
 
 
+class ToolDefinitionConfig(FabricBaseModel):
+    """One named normalized tool or tool-group definition."""
+
+    kind: str = Field(min_length=1, pattern=r"\S")
+    ref: str = Field(min_length=1, pattern=r"\S")
+    settings: dict[str, Any] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+    )
+
+    @field_validator("kind", "ref")
+    @classmethod
+    def _validate_identity(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("tool definition values must be non-empty strings")
+        return value
+
+
 class ToolsConfig(FabricBaseModel):
     """Harness-neutral tool capability configuration."""
+
+    definitions: dict[str, ToolDefinitionConfig] = Field(
+        default_factory=dict,
+        exclude_if=lambda value: not value,
+        description="Named normalized tool and tool-group definitions.",
+    )
 
     enabled: list[str] | None = Field(
         default=None,
@@ -490,8 +771,18 @@ class ToolsConfig(FabricBaseModel):
     )
     blocked: list[str] = Field(
         default_factory=list,
+        exclude_if=lambda value: not value,
         description="Adapter-native tool names to deny.",
     )
+
+    @field_validator("definitions")
+    @classmethod
+    def _validate_definition_names(
+        cls, value: dict[str, ToolDefinitionConfig]
+    ) -> dict[str, ToolDefinitionConfig]:
+        if any(not name.strip() for name in value):
+            raise ValueError("tool definition names must not be empty")
+        return value
 
     @field_validator("enabled", "blocked")
     @classmethod
@@ -509,6 +800,34 @@ class ToolsConfig(FabricBaseModel):
                 raise ValueError(f"tool {name!r} cannot be both enabled and blocked")
         return self
 
+    def add_definition(
+        self,
+        name: str,
+        *,
+        kind: str,
+        ref: str,
+        settings: Mapping[str, Any] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> Self:
+        """Add or replace one named definition and return this tools config."""
+
+        if not name.strip():
+            raise ValueError("tool definition names must not be empty")
+        value = {
+            "kind": kind,
+            "ref": ref,
+            "settings": dict(settings or {}),
+            **dict(extra_fields or {}),
+        }
+        self.definitions[name] = ToolDefinitionConfig.model_validate(value)
+        return self
+
+    def remove_definition(self, name: str) -> Self:
+        """Remove one named definition and return this tools config."""
+
+        self.definitions.pop(name, None)
+        return self
+
 
 class FabricConfig(FabricBaseModel):
     """SDK-facing typed NeMo Fabric agent configuration.
@@ -522,6 +841,7 @@ class FabricConfig(FabricBaseModel):
     schema_version: str = "fabric.agent/v1alpha1"
     metadata: MetadataConfig
     harness: HarnessConfig
+    workflow: WorkflowConfig | None = None
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     environment: EnvironmentConfig | None = None
     models: dict[str, ModelConfig] = Field(default_factory=dict)
@@ -552,10 +872,20 @@ class FabricConfig(FabricBaseModel):
         *,
         transport: str,
         url: str,
+        args: Sequence[str] | None = None,
+        env: Mapping[str, str] | None = None,
+        authentication: McpAuthenticationConfig | None = None,
+        custom_headers: Mapping[str, str] | None = None,
         exposure: Literal["harness_native", "fabric_managed"] = "harness_native",
+        allowed_tools: Sequence[str] | None = None,
+        blocked_tools: Sequence[str] = (),
         extra_fields: Mapping[str, Any] | None = None,
     ) -> Self:
-        """Add or replace a named MCP server and return this config."""
+        """Add or replace a named MCP server and return this config.
+
+        For stdio, set ``url`` to the executable and pass each command-line
+        argument as a separate ``args`` element.
+        """
 
         if self.mcp is None:
             self.mcp = McpConfig()
@@ -563,7 +893,13 @@ class FabricConfig(FabricBaseModel):
             name,
             transport=transport,
             url=url,
+            args=args,
+            env=env,
+            authentication=authentication,
+            custom_headers=custom_headers,
             exposure=exposure,
+            allowed_tools=allowed_tools,
+            blocked_tools=blocked_tools,
             extra_fields=extra_fields,
         )
         return self
@@ -604,6 +940,42 @@ class FabricConfig(FabricBaseModel):
             if tool not in existing:
                 existing.append(tool)
         self.tools.blocked = existing
+        return self
+
+    def add_tool_definition(
+        self,
+        name: str,
+        *,
+        kind: str,
+        ref: str,
+        settings: Mapping[str, Any] | None = None,
+        extra_fields: Mapping[str, Any] | None = None,
+    ) -> Self:
+        """Add or replace one named tool definition and return this config."""
+
+        if self.tools is None:
+            self.tools = ToolsConfig()
+        self.tools.add_definition(
+            name,
+            kind=kind,
+            ref=ref,
+            settings=settings,
+            extra_fields=extra_fields,
+        )
+        return self
+
+    def remove_tool_definition(self, name: str) -> Self:
+        """Remove one named tool definition and return this config."""
+
+        if self.tools is not None:
+            self.tools.remove_definition(name)
+            if (
+                not self.tools.definitions
+                and self.tools.enabled is None
+                and not self.tools.blocked
+                and not self.tools.model_extra
+            ):
+                self.tools = None
         return self
 
     def enable_relay(

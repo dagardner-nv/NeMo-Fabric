@@ -16,6 +16,7 @@ from nemo_fabric.models import FabricConfig
 from nemo_fabric.models import HarnessConfig
 from nemo_fabric.models import InstructionConfig
 from nemo_fabric.models import InstructionsConfig
+from nemo_fabric.models import McpAuthenticationConfig
 from nemo_fabric.models import McpConfig
 from nemo_fabric.models import McpServerConfig
 from nemo_fabric.models import MetadataConfig
@@ -37,6 +38,9 @@ from nemo_fabric.models import SkillConfig
 from nemo_fabric.models import TelemetryConfig
 from nemo_fabric.models import TelemetryProviderConfig
 from nemo_fabric.models import ToolsConfig
+from nemo_fabric.models import ToolDefinitionConfig
+from nemo_fabric.models import WorkflowConfig
+from nemo_fabric.models import WorkflowEntrypointConfig
 from nemo_fabric.runtime import Runtime
 from nemo_fabric.runtime import RuntimeStatus
 from nemo_fabric.streaming import InvokeStream
@@ -73,6 +77,7 @@ __all__ = [
     "InstructionConfig",
     "InstructionsConfig",
     "InvokeStream",
+    "McpAuthenticationConfig",
     "McpConfig",
     "McpServerConfig",
     "MetadataConfig",
@@ -105,4 +110,7 @@ __all__ = [
     "TelemetryProviderConfig",
     "TelemetryRef",
     "ToolsConfig",
+    "ToolDefinitionConfig",
+    "WorkflowConfig",
+    "WorkflowEntrypointConfig",
 ]

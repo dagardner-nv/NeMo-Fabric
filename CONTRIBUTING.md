@@ -19,11 +19,12 @@ Install these tools before you start:
 
 - **Rust** (stable toolchain) -- install with [rustup](https://rustup.rs/)
 - **Python** >= 3.11
+- **Node.js** >= 20.18.3 with npm
 - **uv** -- follow the [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
 - **just** >= 1.50.0 -- `cargo install just --locked`
 
-Clone the repository, create a virtual environment, and build the Rust and
-Python packages:
+Clone the repository, create a virtual environment, and build the Rust,
+Python, and TypeScript packages:
 
 ```bash
 git clone https://github.com/NVIDIA/NeMo-Fabric.git
@@ -73,15 +74,11 @@ complete list of adapters and installation options.
 
 ## Release Tagging
 
-Versioned release tags must use raw Rust-compatible SemVer without a leading
-`v`.
+Release tags use SemVer with a leading `v`.
 
-- Use `0.1.0` for stable releases.
-- Use `0.1.0-rc.1` for prereleases.
-- Do not create tags such as `v0.1.0` or `v0.1.0-rc.1`.
-
-This keeps release tags aligned with Cargo package versions and lets the release
-tooling translate the version consistently for Python packages.
+- Use `v0.1.0` for stable releases.
+- Use `v0.1.0-rc.1` for prereleases.
+- Do not use tags such as `0.1.0` or `0.1.0-rc.1`.
 
 ## Code Style
 
@@ -103,17 +100,25 @@ Follow the existing style in the Python SDK, adapters, examples, and tests.
 Use type annotations for public APIs and keep native binding declarations in
 sync with their Rust implementations.
 
+### TypeScript
+
+Use strict TypeScript for the adapter-contract binding. Preserve the JSON wire
+property names, run the checked-in generator instead of editing generated
+declarations, and keep production dependencies out of the contract package.
+
 ### General
 
-Use the naming conventions appropriate to each language: Rust and Python use
-`snake_case` for functions and variables, Rust types use `PascalCase`, and
-Python classes use `PascalCase`.
+Use the naming conventions appropriate to each language. Rust and Python use
+`snake_case` for functions and variables. Rust, Python, and TypeScript types use
+`PascalCase`. TypeScript contract properties preserve the wire `snake_case`
+names.
 
 ## Testing
 
 **Run tests for every language surface affected by your changes.** If a change
-touches the Rust core or public schemas, run both the Rust and Python suites
-because the Python SDK and adapters depend on the native core contract.
+touches the Rust core or public adapter-contract schemas, run the Rust, Python,
+and TypeScript suites because both language bindings depend on the generated
+wire contract.
 
 Run the affected test targets through the repository `justfile`:
 
@@ -124,7 +129,10 @@ just test-rust
 # Python SDK, adapters, integrations, and examples
 just test-python
 
-# Both suites
+# TypeScript adapter contract
+just test-typescript
+
+# All supported language surfaces
 just test-all
 ```
 
@@ -137,8 +145,9 @@ just no_uv=true test-all
 ```
 
 When adding functionality, include tests in the corresponding Rust crate or in
-the relevant area under `tests/`. Public contract changes must keep the checked-in
-JSON Schema snapshots and native Python binding declarations synchronized.
+the relevant area under `tests/`. Public contract changes must keep the
+checked-in JSON Schema snapshots, Python representations, and generated
+TypeScript declarations synchronized.
 
 ## Documentation Checklist
 

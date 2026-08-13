@@ -15,6 +15,7 @@ import importlib.machinery
 import os
 import sys
 import types
+import uuid
 from collections.abc import AsyncIterator
 from collections.abc import Iterator
 from pathlib import Path
@@ -23,11 +24,19 @@ from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
 
 import pytest
+from nemo_fabric_adapter_contract.codec import ContractValidationError
+from nemo_fabric_adapter_contract.models import AgentConfig
+from nemo_fabric_adapter_contract.models import AgentMcpServerConfig
+from nemo_fabric_adapter_contract.models import McpOAuth2Config
+from nemo_fabric_adapter_contract.models import McpServiceAccountConfig
+from nemo_fabric_adapter_contract.models import RuntimeContext
 from nemo_fabric_adapters.deepagents import adapter  # noqa: E402
 
 
 def lifecycle_start_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in payload.items() if key != "request"}
+    start = {key: value for key, value in payload.items() if key != "request"}
+    start["config"] = AgentConfig.from_mapping(start["config"])
+    return start
 
 
 def lifecycle_invocation(payload: dict[str, Any]) -> dict[str, Any]:
@@ -42,6 +51,21 @@ async def invoke_once(payload: dict[str, Any]) -> dict[str, Any]:
     await runtime.start(lifecycle_start_payload(payload))
     try:
         return await runtime.invoke(lifecycle_invocation(payload))
+    finally:
+        await runtime.stop()
+
+
+async def invoke_twice(
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Two ordered invocations on one runtime, which is how Relay state outlives a turn."""
+
+    runtime = adapter.DeepAgentsRuntime()
+    await runtime.start(lifecycle_start_payload(payload))
+    try:
+        first = await runtime.invoke(lifecycle_invocation(payload))
+        second = await runtime.invoke(lifecycle_invocation(payload))
+        return first, second
     finally:
         await runtime.stop()
 
@@ -167,10 +191,17 @@ def make_payload_fixture():
             "runtime_context": {
                 "runtime_id": runtime_id,
                 "invocation_id": "inv-1",
-                "environment": {"workspace": str(tmp_path)},
+                "request_id": "request-1",
+                "environment": {
+                    "environment_id": "test-environment",
+                    "provider": "test",
+                    "control_location": "in_env_control",
+                    "workspace": str(tmp_path),
+                    "ownership": "caller_owned",
+                },
+                "artifacts": {},
             },
             "request": {"input": "hello", "request_id": "request-1"},
-            "capability_plan": {},
         }
 
     return make
@@ -204,6 +235,20 @@ def fake_relay_fixture(monkeypatch):
     class ScopeType:
         Agent = "agent"
 
+    class _Handle:
+        """Stand-in for nemo_relay ScopeHandle; the adapter compares ``uuid``."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.uuid = str(uuid.uuid4())
+
+    # Relay keeps one LIFO scope stack that outlives an invocation, so the fake keeps
+    # one too: a scope that fails to unwind stays current for later turns, which is the
+    # state the adapter has to detect.
+    stack: list[_Handle] = [_Handle("root")]
+    calls["stack"] = stack
+    calls["handle_type"] = _Handle
+
     @contextlib.contextmanager
     def scope_ctx(
         name: str,
@@ -214,7 +259,14 @@ def fake_relay_fixture(monkeypatch):
         # ``deepagents-request`` Agent scope wraps the invocation.
         calls.setdefault("scopes", []).append((name, scope_type))
         calls.setdefault("scope_metadata", []).append(kwargs.get("metadata"))
-        yield
+        stack.append(_Handle(name))
+        try:
+            yield
+        finally:
+            stack.pop()
+
+    def get_handle() -> _Handle:
+        return stack[-1]
 
     class NemoRelayDeepAgentsCallbackHandler:
         def __init__(self, *_args: object, **_kwargs: object) -> None:
@@ -228,6 +280,7 @@ def fake_relay_fixture(monkeypatch):
     plugin_mod.plugin = plugin_ctx
     scope_mod = types.ModuleType("nemo_relay.scope")
     scope_mod.scope = scope_ctx
+    scope_mod.get_handle = get_handle
     relay_root.plugin = plugin_mod
     relay_root.scope = scope_mod
     relay_root.ScopeType = ScopeType
@@ -291,8 +344,12 @@ async def test_single_invocation_normalizes_response_usage_and_thread(
     assert "instructions" not in fake_sdks["create_kwargs"]
 
 
-async def test_missing_api_key_fails_runtime_start(tmp_path, make_payload):
-    os.environ.pop("NVIDIA_API_KEY", None)
+@pytest.mark.parametrize("api_key", [None, ""])
+async def test_missing_api_key_fails_runtime_start(tmp_path, make_payload, api_key):
+    if api_key is None:
+        os.environ.pop("NVIDIA_API_KEY", None)
+    else:
+        os.environ["NVIDIA_API_KEY"] = api_key
 
     with pytest.raises(RuntimeError, match="NVIDIA_API_KEY"):
         await adapter.DeepAgentsRuntime().start(
@@ -352,14 +409,9 @@ async def test_relay_telemetry_wraps_agent_and_reports_artifacts(
         adapter.common_utils, "collect_relay_artifacts", lambda _c: artifacts
     )
     payload = make_payload(tmp_path)
-    payload["telemetry_plan"] = {
-        "providers": ["relay"],
+    payload["runtime_context"]["telemetry"] = {
         "relay_enabled": True,
-        "relay_project": None,
-        "relay_output_dir": None,
-        "relay_config": {},
-        "native_config": None,
-        "adapter_outputs": [],
+        "metadata": {"telemetry_providers": ["relay"]},
     }
 
     output = await invoke_once(payload)
@@ -386,40 +438,512 @@ async def test_relay_telemetry_wraps_agent_and_reports_artifacts(
     )
 
 
+@pytest.fixture(name="relay_payload")
+def relay_payload_fixture(make_payload, monkeypatch):
+    """Build a payload with Relay telemetry enabled and its plugin config stubbed."""
+
+    monkeypatch.setattr(
+        adapter.common_utils,
+        "load_relay_plugin_config",
+        lambda _p: {"version": 1, "components": []},
+    )
+
+    def build(tmp_path) -> dict[str, Any]:
+        payload = make_payload(tmp_path)
+        payload["runtime_context"]["telemetry"] = {
+            "relay_enabled": True,
+            "metadata": {"telemetry_providers": ["relay"]},
+        }
+        return payload
+
+    return build
+
+
+async def test_relay_scope_teardown_failure_keeps_the_invocation_completed(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """A telemetry teardown fault must not rewrite a completed turn into a failure.
+
+    Relay closes scopes in LIFO order, but LangGraph runs concurrent chain callbacks
+    that can finish out of that order, so closing the outer ``deepagents-request``
+    scope can raise after the agent has already produced its final response.
+    """
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def exploding_scope(name: str, scope_type: object, **kwargs: object):
+        yield
+        raise RuntimeError(
+            "invalid argument: scope handle is not at the top of the stack"
+        )
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", exploding_scope)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    # The functional outcome is preserved in full.
+    assert output["completed"] is True
+    assert output["failed"] is False
+    assert output["error"] is None
+    assert output["response"] == "reply to hello"
+    assert output["message_count"] == 2
+    # ...and the telemetry fault is still reported, so a consumer can tell that
+    # observability degraded and the referenced trajectory may be truncated.
+    assert output["telemetry"]["degraded"] is True
+    assert "scope handle is not at the top of the stack" in output["telemetry"]["error"]
+
+
+async def test_relay_plugin_teardown_failure_keeps_the_invocation_completed(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """The plugin context manager is the other half of the telemetry lifecycle.
+
+    A failed export flush on the way out is as much an observability fault as a failed
+    scope pop, and must be treated the same way.
+    """
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def exploding_plugin(config: object):
+        yield
+        raise RuntimeError("relay plugin flush failed")
+
+    monkeypatch.setattr(sys.modules["nemo_relay.plugin"], "plugin", exploding_plugin)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    assert output["completed"] is True
+    assert output["failed"] is False
+    assert output["error"] is None
+    assert output["response"] == "reply to hello"
+    assert output["telemetry"]["degraded"] is True
+    assert output["telemetry"]["error"] == "RuntimeError: relay plugin flush failed"
+
+
+async def test_a_dirty_scope_stack_quarantines_telemetry_for_later_turns(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Relay's scope stack outlives an invocation, so a fault poisons the runtime.
+
+    Preserving the completed turn is not enough on its own: the scope left current by
+    turn 1 is still current for turn 2, which would otherwise report itself clean while
+    nesting its trajectory under a stale scope.
+    """
+
+    import contextlib
+
+    entered: list[str] = []
+
+    @contextlib.contextmanager
+    def leaking_scope(name: str, scope_type: object, **kwargs: object):
+        # Mirrors the real failure: the child scope is never popped, so the outer close
+        # raises and the scope pushed here stays current for every later turn.
+        entered.append(name)
+        fake_relay["stack"].append(fake_relay["handle_type"](name))
+        yield
+        raise RuntimeError(
+            "invalid argument: scope handle is not at the top of the stack"
+        )
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", leaking_scope)
+    # A recognisable artifact so the faulting turn's publication can be checked by value
+    # rather than by the key merely existing: real collection over an empty evidence dir
+    # returns [], which would pass a presence-only assertion either way.
+    artifacts = [{"kind": "atif", "path": str(tmp_path / "trajectory.atif.json")}]
+    monkeypatch.setattr(
+        adapter.common_utils, "collect_relay_artifacts", lambda _config: artifacts
+    )
+
+    first, second = await invoke_twice(relay_payload(tmp_path))
+
+    assert first["completed"] is True
+    assert first["telemetry"]["degraded"] is True
+
+    # Turn 2 is functionally fine and must stay completed, but it ran on a dirty stack
+    # and must not claim clean telemetry.
+    assert second["completed"] is True
+    assert second["error"] is None
+    assert second["response"] == "reply to hello"
+    assert second["telemetry"]["degraded"] is True
+    assert "unreliable" in second["telemetry"]["error"]
+    # Only turn 1 opened a request scope; turn 2 must not push onto the dirty stack.
+    assert entered == ["deepagents-request"]
+    # Turn 1 opened a scope and produced its own (partial) artifacts, so it still
+    # publishes them; turn 2 has none of its own and must not claim turn 1's.
+    assert first["relay_artifacts"] == artifacts
+    assert "relay_artifacts" not in second
+
+    # Turn 1 owns the fault, so it reports it verbatim and needs no separate cause.
+    assert "not at the top of the stack" in first["telemetry"]["error"]
+    assert "quarantine_cause" not in first["telemetry"]
+    # Turn 2 did not fail this way, so the fault appears only as provenance. Repeating
+    # it in ``error`` would make a consumer count one fault per turn and blame the wrong
+    # turn for it.
+    assert "not at the top of the stack" not in second["telemetry"]["error"]
+    assert "not at the top of the stack" in second["telemetry"]["quarantine_cause"]
+
+
+async def test_an_agent_failure_on_a_quarantined_turn_keeps_both_domains(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Quarantine must not swallow, or be swallowed by, a real agent failure."""
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def leaking_scope(name: str, scope_type: object, **kwargs: object):
+        fake_relay["stack"].append(fake_relay["handle_type"](name))
+        yield
+        raise RuntimeError(
+            "invalid argument: scope handle is not at the top of the stack"
+        )
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", leaking_scope)
+    payload = relay_payload(tmp_path)
+
+    runtime = adapter.DeepAgentsRuntime()
+    await runtime.start(lifecycle_start_payload(payload))
+    try:
+        await runtime.invoke(lifecycle_invocation(payload))
+
+        async def boom(*_args: object, **_kwargs: object):
+            raise RuntimeError("model call failed")
+
+        monkeypatch.setattr(adapter, "invoke_compiled_agent", boom)
+        quarantined = await runtime.invoke(lifecycle_invocation(payload))
+    finally:
+        await runtime.stop()
+
+    assert quarantined["completed"] is False
+    assert quarantined["failed"] is True
+    assert quarantined["error"] == "RuntimeError: model call failed"
+    assert quarantined["telemetry"]["degraded"] is True
+    assert "unreliable" in quarantined["telemetry"]["error"]
+
+
+async def test_quarantine_survives_a_stop_and_restart(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """The dirty stack lives in the process, so a restart inherits it.
+
+    Clearing the quarantine in ``stop()`` alongside the rest of the runtime state would
+    hand the next runtime a clean bill of health on a stack that is still corrupt.
+    """
+
+    import contextlib
+
+    entries = {"count": 0}
+
+    @contextlib.contextmanager
+    def leaks_once(name: str, scope_type: object, **kwargs: object):
+        # Only the first turn leaks. A later turn would unwind cleanly and report itself
+        # clean, so this test fails unless the quarantine itself carried across the
+        # restart — the stack is still dirty even though nothing new damages it.
+        entries["count"] += 1
+        handle = fake_relay["handle_type"](name)
+        fake_relay["stack"].append(handle)
+        if entries["count"] == 1:
+            yield
+            raise RuntimeError(
+                "invalid argument: scope handle is not at the top of the stack"
+            )
+        try:
+            yield
+        finally:
+            fake_relay["stack"].remove(handle)
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", leaks_once)
+    payload = relay_payload(tmp_path)
+
+    runtime = adapter.DeepAgentsRuntime()
+    await runtime.start(lifecycle_start_payload(payload))
+    first = await runtime.invoke(lifecycle_invocation(payload))
+    await runtime.stop()
+
+    await runtime.start(lifecycle_start_payload(payload))
+    try:
+        after_restart = await runtime.invoke(lifecycle_invocation(payload))
+    finally:
+        await runtime.stop()
+
+    assert first["telemetry"]["degraded"] is True
+    assert after_restart["completed"] is True
+    assert after_restart["telemetry"]["degraded"] is True
+    assert "unreliable" in after_restart["telemetry"]["error"]
+    # The restarted runtime never opened a scope of its own; it inherited the verdict.
+    assert entries["count"] == 1
+
+
+async def test_an_unreadable_scope_handle_counts_as_dirty(monkeypatch):
+    """A safety check must fail closed when it cannot read the state it guards.
+
+    Comparing missing attributes with a ``None`` default made two unreadable handles
+    look equal, which silently disabled the quarantine.
+    """
+
+    class Bare:
+        """A handle carrying no identity, as a future Relay rename would produce."""
+
+    monkeypatch.setattr(adapter, "_current_scope_handle", lambda: Bare())
+
+    assert adapter._scope_top_unchanged(Bare()) is False
+
+
+async def test_a_fault_that_unwinds_cleanly_does_not_quarantine_later_turns(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Quarantine is for a dirty stack, not for any telemetry fault.
+
+    A flush that fails after the scope unwound leaves nothing stale behind, so the next
+    turn is genuinely clean and must be reported that way.
+    """
+
+    import contextlib
+
+    flushes = {"count": 0}
+
+    @contextlib.asynccontextmanager
+    async def flaky_plugin(config: object):
+        yield
+        flushes["count"] += 1
+        if flushes["count"] == 1:
+            raise RuntimeError("relay plugin flush failed")
+
+    monkeypatch.setattr(sys.modules["nemo_relay.plugin"], "plugin", flaky_plugin)
+
+    first, second = await invoke_twice(relay_payload(tmp_path))
+
+    assert first["telemetry"]["degraded"] is True
+    assert "degraded" not in second["telemetry"]
+    assert "error" not in second["telemetry"]
+
+
+async def test_scope_and_plugin_teardown_faults_are_both_reported(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """A scope fault crossing the plugin's ``__aexit__`` is replaced by the plugin's.
+
+    Both stages must survive that, or one lifecycle fault silently disappears.
+    """
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def exploding_scope(name: str, scope_type: object, **kwargs: object):
+        yield
+        raise RuntimeError("scope handle is not at the top of the stack")
+
+    @contextlib.asynccontextmanager
+    async def exploding_plugin(config: object):
+        yield
+        raise RuntimeError("relay plugin flush failed")
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", exploding_scope)
+    monkeypatch.setattr(sys.modules["nemo_relay.plugin"], "plugin", exploding_plugin)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    assert output["completed"] is True
+    assert output["error"] is None
+    assert output["telemetry"]["degraded"] is True
+    assert "scope handle is not at the top of the stack" in output["telemetry"]["error"]
+    assert "relay plugin flush failed" in output["telemetry"]["error"]
+
+
+async def test_callback_handler_construction_failure_is_a_normalized_failure(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Building the callback handler is telemetry setup, so it must normalize too.
+
+    Constructing it outside the guarded region would let the error escape ``invoke``
+    instead of returning the required invocation-failure response.
+    """
+
+    def exploding_handler(*_args: object, **_kwargs: object):
+        raise RuntimeError("callback handler construction failed")
+
+    monkeypatch.setattr(
+        sys.modules["nemo_relay.integrations.deepagents"],
+        "NemoRelayDeepAgentsCallbackHandler",
+        exploding_handler,
+    )
+    invoke_agent = AsyncMock()
+    monkeypatch.setattr(adapter, "invoke_compiled_agent", invoke_agent)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    invoke_agent.assert_not_awaited()
+    assert output["completed"] is False
+    assert output["failed"] is True
+    assert output["error"] == "RuntimeError: callback handler construction failed"
+    # The same fault is reported in both domains, as it is for any other setup failure.
+    assert output["telemetry"]["degraded"] is True
+    assert (
+        output["telemetry"]["error"]
+        == "RuntimeError: callback handler construction failed"
+    )
+
+
+async def test_artifact_collection_failure_does_not_discard_a_completed_turn(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Collecting artifact references walks the filesystem, so it can fail on its own.
+
+    It runs after the turn is over, so letting it raise would throw away a completed
+    invocation — the same failure mode the invocation/telemetry split exists to stop.
+    """
+
+    def boom(_config: object) -> list[dict[str, str]]:
+        raise OSError("artifact directory disappeared")
+
+    monkeypatch.setattr(adapter.common_utils, "collect_relay_artifacts", boom)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    assert output["completed"] is True
+    assert output["failed"] is False
+    assert output["error"] is None
+    assert output["telemetry"]["degraded"] is True
+    assert output["telemetry"]["error"] == "OSError: artifact directory disappeared"
+
+
+async def test_teardown_and_artifact_faults_are_both_reported(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Two telemetry faults in one turn: neither may silently swallow the other."""
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def exploding_scope(name: str, scope_type: object, **kwargs: object):
+        yield
+        raise RuntimeError("scope handle is not at the top of the stack")
+
+    def boom(_config: object) -> list[dict[str, str]]:
+        raise OSError("artifact directory disappeared")
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", exploding_scope)
+    monkeypatch.setattr(adapter.common_utils, "collect_relay_artifacts", boom)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    assert output["completed"] is True
+    assert output["telemetry"]["degraded"] is True
+    assert "scope handle is not at the top of the stack" in output["telemetry"]["error"]
+    assert "artifact directory disappeared" in output["telemetry"]["error"]
+
+
+async def test_relay_setup_failure_before_the_agent_runs_stays_an_invocation_failure(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Telemetry that fails on the way *in* leaves no functional outcome to preserve."""
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def failing_scope(name: str, scope_type: object, **kwargs: object):
+        raise RuntimeError("relay scope push failed")
+        yield  # pragma: no cover - unreachable, keeps this a generator
+
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", failing_scope)
+    invoke_agent = AsyncMock()
+    monkeypatch.setattr(adapter, "invoke_compiled_agent", invoke_agent)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    # The setup fault must short-circuit before any agent request is consumed.
+    invoke_agent.assert_not_awaited()
+    assert output["completed"] is False
+    assert output["failed"] is True
+    assert output["error"] == "RuntimeError: relay scope push failed"
+    # The same fault is also a telemetry fault, so it is reported in both domains.
+    assert output["telemetry"]["degraded"] is True
+    assert output["telemetry"]["error"] == "RuntimeError: relay scope push failed"
+
+
+async def test_agent_failure_under_relay_is_still_an_invocation_failure(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """Guard against the split widening: a real agent failure must still fail."""
+
+    async def boom(*_args: object, **_kwargs: object):
+        raise RuntimeError("model call failed")
+
+    monkeypatch.setattr(adapter, "invoke_compiled_agent", boom)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    assert output["completed"] is False
+    assert output["failed"] is True
+    assert output["error"] == "RuntimeError: model call failed"
+    # A clean telemetry lifecycle leaves the telemetry block untouched.
+    assert "error" not in output["telemetry"]
+    assert "degraded" not in output["telemetry"]
+
+
+async def test_agent_failure_and_teardown_failure_keep_their_own_domains(
+    tmp_path, relay_payload, monkeypatch, fake_sdks, fake_relay
+):
+    """When both fail, the invocation error stays the agent's, not the telemetry one."""
+
+    import contextlib
+
+    async def boom(*_args: object, **_kwargs: object):
+        raise RuntimeError("model call failed")
+
+    @contextlib.contextmanager
+    def exploding_scope(name: str, scope_type: object, **kwargs: object):
+        yield
+        raise RuntimeError("scope handle is not at the top of the stack")
+
+    monkeypatch.setattr(adapter, "invoke_compiled_agent", boom)
+    monkeypatch.setattr(sys.modules["nemo_relay.scope"], "scope", exploding_scope)
+
+    output = await invoke_once(relay_payload(tmp_path))
+
+    assert output["completed"] is False
+    assert output["failed"] is True
+    assert output["error"] == "RuntimeError: model call failed"
+    assert output["telemetry"]["degraded"] is True
+    assert "scope handle is not at the top of the stack" in output["telemetry"]["error"]
+
+
 async def test_native_telemetry_exports_without_artifacts(
     tmp_path, make_payload, monkeypatch, fake_sdks, fake_relay
 ):
     payload = make_payload(tmp_path)
-    payload["telemetry_plan"] = {
-        "providers": ["native"],
+    payload["runtime_context"]["telemetry"] = {
         "relay_enabled": False,
-        "relay_project": None,
-        "relay_output_dir": None,
-        "relay_config": None,
-        "native_config": {
-            "version": 1,
-            "components": [
-                {
-                    "kind": "observability",
-                    "enabled": True,
-                    "config": {
-                        "version": 1,
-                        "opentelemetry": {
-                            "enabled": True,
-                            "endpoint": "http://localhost:4318/v1/traces",
+        "metadata": {
+            "telemetry_providers": ["native"],
+            "native_config": {
+                "version": 1,
+                "components": [
+                    {
+                        "kind": "observability",
+                        "enabled": True,
+                        "config": {
+                            "version": 1,
+                            "opentelemetry": {
+                                "enabled": True,
+                                "endpoint": "http://localhost:4318/v1/traces",
+                            },
                         },
-                    },
-                }
-            ],
+                    }
+                ],
+            },
         },
-        "adapter_outputs": [],
     }
 
     output = await invoke_once(payload)
 
     assert fake_relay["wrapped"]
     assert fake_relay["plugin_open"]
-    assert fake_relay["plugin_configs"] == [payload["telemetry_plan"]["native_config"]]
+    assert fake_relay["plugin_configs"] == [
+        payload["runtime_context"]["telemetry"]["metadata"]["native_config"]
+    ]
     assert output["telemetry"] == {
         "enabled": True,
         "provider": "native",
@@ -434,6 +958,29 @@ async def test_native_telemetry_exports_without_artifacts(
     assert fake_relay["callback_handler"] in (fake_sdks["config"] or {}).get(
         "callbacks", []
     )
+
+
+def test_native_telemetry_requires_mapping(tmp_path, make_payload):
+    payload = make_payload(tmp_path)
+    payload["runtime_context"]["telemetry"] = {
+        "relay_enabled": False,
+        "metadata": {
+            "telemetry_providers": ["native"],
+            "native_config": [],
+        },
+    }
+
+    with pytest.raises(
+        adapter.AdapterConfigError, match="native_config must be a mapping"
+    ):
+        adapter.resolve_observability(
+            RuntimeContext.from_mapping(payload["runtime_context"]),
+            str(tmp_path),
+            "deepagents-test",
+            "model",
+            "native",
+            False,
+        )
 
 
 async def test_relay_disabled_adds_no_scope_or_callbacks(
@@ -471,16 +1018,21 @@ async def test_missing_nemo_relay_with_native_telemetry_fails_runtime_start(
     monkeypatch.setattr(importlib_util, "find_spec", fake_find_spec)
 
     payload = make_payload(tmp_path)
-    payload["telemetry_plan"] = {
-        "providers": ["native"],
+    payload["runtime_context"]["telemetry"] = {
         "relay_enabled": False,
-        "native_config": {
-            "version": 1,
-            "components": [
-                {"kind": "observability", "enabled": True, "config": {"version": 1}}
-            ],
+        "metadata": {
+            "telemetry_providers": ["native"],
+            "native_config": {
+                "version": 1,
+                "components": [
+                    {
+                        "kind": "observability",
+                        "enabled": True,
+                        "config": {"version": 1},
+                    }
+                ],
+            },
         },
-        "adapter_outputs": [],
     }
 
     with pytest.raises(RuntimeError, match="nemo-relay.*\\[relay\\]"):
@@ -493,16 +1045,21 @@ async def test_incomplete_nemo_relay_install_fails_runtime_start(
 ):
     monkeypatch.delitem(sys.modules, "nemo_relay.integrations.deepagents")
     payload = make_payload(tmp_path)
-    payload["telemetry_plan"] = {
-        "providers": ["native"],
+    payload["runtime_context"]["telemetry"] = {
         "relay_enabled": False,
-        "native_config": {
-            "version": 1,
-            "components": [
-                {"kind": "observability", "enabled": True, "config": {"version": 1}}
-            ],
+        "metadata": {
+            "telemetry_providers": ["native"],
+            "native_config": {
+                "version": 1,
+                "components": [
+                    {
+                        "kind": "observability",
+                        "enabled": True,
+                        "config": {"version": 1},
+                    }
+                ],
+            },
         },
-        "adapter_outputs": [],
     }
 
     with pytest.raises(RuntimeError, match="compatible 'nemo-relay'.*\\[relay\\]"):
@@ -524,6 +1081,15 @@ def test_apply_callbacks_without_callbacks_leaves_config_untouched():
     assert adapter._apply_callbacks(config, None) == {
         "configurable": {"thread_id": "t"}
     }
+
+
+def test_state_dir_uses_runtime_artifact_context(tmp_path, make_payload, monkeypatch):
+    context = RuntimeContext.from_mapping(make_payload(tmp_path)["runtime_context"])
+    monkeypatch.setenv("FABRIC_ARTIFACTS", str(tmp_path / "ignored"))
+
+    assert adapter.state_dir(context, str(tmp_path)) == (
+        tmp_path / "artifacts" / "deepagents" / ".fabric"
+    )
 
 
 async def test_invoke_compiled_agent_wires_callbacks_into_run_config(fake_sdks):
@@ -597,28 +1163,68 @@ async def test_mcp_servers_become_adapter_tools(
         types.ModuleType("langchain_mcp_adapters"),
     )
     monkeypatch.setitem(sys.modules, "langchain_mcp_adapters.client", client_mod)
-
     payload = make_payload(tmp_path)
-    # McpServerPlan carries the URL/command in ``url``.
-    payload["capability_plan"] = {
-        "native": {
-            "mcp_servers": {
-                "fs": {"transport": "streamable-http", "url": "http://localhost:9/mcp"},
-                "local": {"transport": "stdio", "url": "my-server --flag"},
-            }
+    payload["config"]["mcp"] = {
+        "servers": {
+            "fs": {
+                "transport": "streamable-http",
+                "url": "http://localhost:9/mcp",
+                "custom_headers": {"X-Tenant": "${FABRIC_TEST_MCP_HEADER}"},
+            },
+            "local": {
+                "transport": "stdio",
+                "url": "my-server",
+                "args": ["--flag", "--config", "repo config.json"],
+                "env": {"REPO_MCP_MODE": "test"},
+            },
         }
     }
+    monkeypatch.setenv("FABRIC_TEST_MCP_HEADER", "fabric")
 
     output = await invoke_once(payload)
 
     assert output["failed"] is False
-    # Fabric MCP transport is normalized; stdio command/args come from ``url``
     assert mock_client_cls.call_args.args[0] == {
-        "fs": {"transport": "streamable_http", "url": "http://localhost:9/mcp"},
-        "local": {"transport": "stdio", "command": "my-server", "args": ["--flag"]},
+        "fs": {
+            "transport": "streamable_http",
+            "url": "http://localhost:9/mcp",
+            "headers": {"X-Tenant": "fabric"},
+        },
+        "local": {
+            "transport": "stdio",
+            "command": "my-server",
+            "args": ["--flag", "--config", "repo config.json"],
+            "env": {"REPO_MCP_MODE": "test"},
+        },
     }
     tool_names = [tool.name for tool in fake_sdks["create_kwargs"]["tools"]]
     assert tool_names == ["read_file", "write_file"]
+
+
+@pytest.mark.parametrize(
+    "authentication",
+    [
+        McpOAuth2Config(type="oauth2"),
+        McpServiceAccountConfig(
+            type="service_account",
+            client_id="client",
+            client_secret_env="CLIENT_SECRET",
+            token_url="https://auth.example.test/token",
+        ),
+    ],
+)
+def test_deepagents_rejects_mcp_authentication(authentication):
+    with pytest.raises(
+        adapter.AdapterConfigError, match="not supported by Deep Agents"
+    ):
+        adapter._mcp_connection(
+            "automation",
+            AgentMcpServerConfig(
+                transport="streamable-http",
+                url="https://mcp.example.test/mcp",
+                authentication=authentication,
+            ),
+        )
 
 
 @pytest.mark.usefixtures("use_real_langgraph")
@@ -703,7 +1309,7 @@ async def test_openai_provider_keeps_openai_endpoint(
 
 async def test_skill_paths_map_to_skills(tmp_path, make_payload, fake_sdks):
     payload = make_payload(tmp_path)
-    payload["capability_plan"] = {"native": {"skill_paths": ["/skills/a", "/skills/b"]}}
+    payload["config"]["skills"] = {"paths": ["/skills/a", "/skills/b"]}
 
     await invoke_once(payload)
 
@@ -819,14 +1425,9 @@ async def test_persistent_runtime_scopes_relay_per_invocation(
         lambda _config: artifacts,
     )
     payload = make_payload(tmp_path, runtime_id="run-relay-persistent")
-    payload["telemetry_plan"] = {
-        "providers": ["relay"],
+    payload["runtime_context"]["telemetry"] = {
         "relay_enabled": True,
-        "relay_project": None,
-        "relay_output_dir": None,
-        "relay_config": {},
-        "native_config": None,
-        "adapter_outputs": ["atif"],
+        "metadata": {"telemetry_providers": ["relay"], "adapter_outputs": ["atif"]},
     }
     runtime = adapter.DeepAgentsRuntime()
 
@@ -874,8 +1475,14 @@ async def test_subagents_are_gated_by_blocked_tools(tmp_path, make_payload):
         ]
     }
 
-    settings = payload["config"]["harness"]["settings"]
-    create_kwargs = await adapter.build_agent_kwargs(payload, MagicMock(), settings)
+    agent_config = AgentConfig.from_mapping(payload["config"])
+    create_kwargs = await adapter.build_agent_kwargs(
+        agent_config,
+        RuntimeContext.from_mapping(payload["runtime_context"]),
+        payload["base_dir"],
+        MagicMock(),
+        agent_config.harness.settings,
+    )
     assert create_kwargs["middleware"], (
         "main agent blocked-tools middleware not attached"
     )
@@ -912,8 +1519,14 @@ async def test_default_subagent_is_gated_by_blocked_tools(tmp_path, make_payload
     payload = make_payload(tmp_path)
     payload["config"]["tools"] = {"blocked": ["write_file"]}
 
-    settings = payload["config"]["harness"]["settings"]
-    create_kwargs = await adapter.build_agent_kwargs(payload, MagicMock(), settings)
+    agent_config = AgentConfig.from_mapping(payload["config"])
+    create_kwargs = await adapter.build_agent_kwargs(
+        agent_config,
+        RuntimeContext.from_mapping(payload["runtime_context"]),
+        payload["base_dir"],
+        MagicMock(),
+        agent_config.harness.settings,
+    )
 
     assert [subagent["name"] for subagent in create_kwargs["subagents"]] == [
         "general-purpose"
@@ -933,9 +1546,15 @@ async def test_blocked_tools_reject_unenforceable_subagents(
         "subagents": [{"name": "worker", **unsupported}]
     }
 
-    settings = payload["config"]["harness"]["settings"]
+    agent_config = AgentConfig.from_mapping(payload["config"])
     with pytest.raises(adapter.AdapterConfigError, match="cannot be enforced"):
-        await adapter.build_agent_kwargs(payload, MagicMock(), settings)
+        await adapter.build_agent_kwargs(
+            agent_config,
+            RuntimeContext.from_mapping(payload["runtime_context"]),
+            payload["base_dir"],
+            MagicMock(),
+            agent_config.harness.settings,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1043,12 +1662,8 @@ async def test_subagent_usage_folded_from_subgraph(tmp_path, make_payload, monke
 async def test_bad_mcp_transport_fails_runtime_start(tmp_path, make_payload):
     # A misconfigured MCP server must fail loudly, not be silently dropped.
     payload = make_payload(tmp_path)
-    payload["capability_plan"] = {
-        "native": {
-            "mcp_servers": {
-                "bad": {"transport": "carrier-pigeon", "url": "http://x/mcp"}
-            }
-        }
+    payload["config"]["mcp"] = {
+        "servers": {"bad": {"transport": "carrier-pigeon", "url": "http://x/mcp"}}
     }
 
     with pytest.raises(adapter.AdapterConfigError, match="transport"):
@@ -1057,11 +1672,11 @@ async def test_bad_mcp_transport_fails_runtime_start(tmp_path, make_payload):
 
 async def test_empty_mcp_url_fails_runtime_start(tmp_path, make_payload):
     payload = make_payload(tmp_path)
-    payload["capability_plan"] = {
-        "native": {"mcp_servers": {"bad": {"transport": "streamable_http", "url": ""}}}
+    payload["config"]["mcp"] = {
+        "servers": {"bad": {"transport": "streamable_http", "url": ""}}
     }
 
-    with pytest.raises(adapter.AdapterConfigError, match="url"):
+    with pytest.raises(ContractValidationError, match="url"):
         await adapter.DeepAgentsRuntime().start(lifecycle_start_payload(payload))
 
 
@@ -1133,4 +1748,6 @@ def test_main_serves_persistent_runtime(monkeypatch):
 
     adapter.main()
 
-    serve.assert_called_once_with(adapter.DeepAgentsRuntime)
+    serve.assert_called_once_with(
+        adapter.DeepAgentsRuntime, config_loader=AgentConfig.from_mapping
+    )

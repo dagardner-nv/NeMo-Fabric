@@ -126,7 +126,9 @@ print(result.output.response)
 `HarnessConfig.adapter_id` selects the Hermes Agent adapter. To use another
 supported harness, install its package extra and set the corresponding adapter
 ID. Pass harness-specific options through `HarnessConfig.settings` only when
-the selected adapter descriptor declares them in `settings_schema`.
+the selected adapter descriptor declares them in `settings_schema`. Adapters
+that expose selectable executables can accept `FabricConfig.workflow`; the
+descriptor's `workflow_schema` defines and validates that adapter-owned block.
 
 For a guided version of this example, refer to the
 [`01_quickstart.ipynb` notebook](examples/notebooks/01_quickstart.ipynb). The
@@ -259,13 +261,16 @@ through adapters. Use the following reference to compare the integrations:
 
 - [Adapter compatibility and guides](adapters/README.md): compare bundled
   harness support, runtime ownership, telemetry integration, and package guides.
+- [Adapter contract](docs/adapter-contract/README.md): build third-party
+  adapters against the canonical schemas or the dependency-free Python and
+  TypeScript contract bindings.
 
 ## Roadmap
 
-- **Custom harnesses:** Publish the NeMo Fabric adapter contract so third-party
-  developers can build integrations that are compatible with NeMo Fabric.
-  Support integrations maintained by NeMo Fabric and compatible third-party
-  integrations.
+- **Custom harnesses:** Publish the NeMo Fabric adapter contract as canonical
+  schemas and dependency-free language bindings so third-party developers can
+  build integrations that are compatible with NeMo Fabric. Support integrations
+  maintained by NeMo Fabric and compatible third-party integrations.
 - **Custom agents:** Support custom agents built on maintained or third-party
   harness integrations without requiring an additional, agent-specific adapter.
   Preserve the normalized NeMo Fabric lifecycle, results, artifacts, and

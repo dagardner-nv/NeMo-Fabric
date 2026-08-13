@@ -73,7 +73,8 @@ def test_harbor_builder_constructs_complete_config_from_harbor_inputs(tmp_path):
     assert config.mcp is not None
     assert set(config.mcp.servers) == {"remote", "local"}
     assert config.mcp.servers["local"].url == "mcp-server"
-    assert config.mcp.servers["local"].extra_fields["args"] == ["--stdio"]
+    assert config.mcp.servers["local"].args == ["--stdio"]
+    assert "args" not in config.mcp.servers["local"].extra_fields
     assert config.skills is not None
     assert config.skills.paths == [str(tmp_path / "skills")]
     assert (
@@ -211,6 +212,9 @@ def test_each_harbor_job_delegates_to_an_independent_fabric_run(
 
 
 def test_codex_adapter_maps_fabric_request_to_sdk(tmp_path):
+    from nemo_fabric_adapter_contract.models import AgentConfig
+    from nemo_fabric_adapter_contract.models import RuntimeContext
+
     adapter = load_codex_adapter()
 
     payload = {
@@ -232,16 +236,28 @@ def test_codex_adapter_maps_fabric_request_to_sdk(tmp_path):
         },
         "runtime_context": {
             "runtime_id": "harbor-test",
-            "environment": {"workspace": str(tmp_path)},
+            "invocation_id": "harbor-invocation",
+            "request_id": "harbor-request",
+            "environment": {
+                "environment_id": "harbor-environment",
+                "provider": "local",
+                "control_location": "in_env_control",
+                "ownership": "caller_owned",
+                "workspace": str(tmp_path),
+            },
+            "artifacts": {},
         },
         "request": {"input": "Fix the calculator."},
     }
 
-    assert adapter.selected_model(payload) == "gpt-5.4"
-    assert adapter.sandbox(payload) == adapter.Sandbox.workspace_write
-    assert adapter._reasoning_effort(payload) == adapter.ReasoningEffort.high
-    assert adapter.thread_config(payload, relay=None) == {}
-    assert adapter.resolve_cwd(payload) == tmp_path
+    config = AgentConfig.from_mapping(payload["config"])
+    context = RuntimeContext.from_mapping(payload["runtime_context"])
+
+    assert adapter.selected_model(config) == "gpt-5.4"
+    assert adapter.sandbox(config) == adapter.Sandbox.workspace_write
+    assert adapter._reasoning_effort(config) == adapter.ReasoningEffort.high
+    assert adapter.thread_config(config, context, relay=None) == {}
+    assert adapter.resolve_cwd(context, payload["base_dir"]) == tmp_path
 
 
 def test_claude_calculator_run_uses_current_adapter_contract():
@@ -485,9 +501,10 @@ def test_swebench_matrix_translates_harbor_inputs_to_typed_config(tmp_path: Path
     assert relay.skills.paths == ["/harbor/skills"]
     assert relay.mcp is not None
     assert set(relay.mcp.servers) == {"fabric-repo-inspector"}
-    assert relay.mcp.servers["fabric-repo-inspector"].extra_fields["args"] == [
+    assert relay.mcp.servers["fabric-repo-inspector"].args == [
         "/tmp/nemo-fabric-config/mcp/repo_inspector.py"
     ]
+    assert "args" not in relay.mcp.servers["fabric-repo-inspector"].extra_fields
     assert tools.tools is not None
     assert tools.tools.blocked == ["browser"]
     assert tools.tools.enabled is None
