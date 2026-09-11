@@ -10,15 +10,20 @@ Create the tag only after the release branch has been created.
 
 ## Determine the version
 
-Require the user to provide the stable release version in
-`<major>.<minor>.<patch>` form. Do not infer it from `Cargo.toml` or a branch
-name, and do not edit `Cargo.toml` while cutting the tag. Set
-`RELEASE_BASE_VERSION` to that user-provided value:
+Require the user to provide the stable release version in either
+`<major>.<minor>` or `<major>.<minor>.<patch>` form. Treat a two-component
+version as `<major>.<minor>.0`. Do not infer the version from `Cargo.toml` or
+a branch name, and do not edit `Cargo.toml` while cutting the tag. Normalize
+the supplied version into `RELEASE_BASE_VERSION`:
 
 ```bash
-RELEASE_BASE_VERSION="<user-provided-major.minor.patch>"
-if ! [[ "${RELEASE_BASE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "Error: release version must be <major>.<minor>.<patch>" >&2
+RELEASE_VERSION_INPUT="<user-provided-major.minor[.patch]>"
+if [[ "${RELEASE_VERSION_INPUT}" =~ ^[0-9]+\.[0-9]+$ ]]; then
+  RELEASE_BASE_VERSION="${RELEASE_VERSION_INPUT}.0"
+elif [[ "${RELEASE_VERSION_INPUT}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  RELEASE_BASE_VERSION="${RELEASE_VERSION_INPUT}"
+else
+  echo "Error: release version must be <major>.<minor> or <major>.<minor>.<patch>" >&2
   exit 1
 fi
 RELEASE_BRANCH="release/$(printf '%s' "${RELEASE_BASE_VERSION}" | cut -d. -f1,2)"
