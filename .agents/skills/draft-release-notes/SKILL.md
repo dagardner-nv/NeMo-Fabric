@@ -74,7 +74,7 @@ not publication-ready copy.
    work. Let the command fail rather than replacing an existing branch:
 
    ```bash
-   git switch -c "docs/create-release-notes-${RELEASE_LINE}" "${RELEASE_BRANCH}"
+   git switch -c "docs/create-release-notes-${TARGET_VERSION}" "${RELEASE_BRANCH}"
    ```
 3. Run the helper. It reports an absent prior release-notes page without
    failing, which is expected for early release branches.
@@ -109,6 +109,20 @@ not publication-ready copy.
     git add docs/about-nemo-fabric/release-notes.mdx
     git commit -sm "Drafting release notes for v${TARGET_VERSION}"
     ```
+12. Open a pull request from the release-notes branch to `${RELEASE_BRANCH}`.
+    Push to the upstream repository, use the repository PR template, and set
+    the title to `docs: Release notes for v${TARGET_VERSION}`:
+
+    ```bash
+    git push -u upstream HEAD
+    gh pr create \
+      --base "${RELEASE_BRANCH}" \
+      --title "docs: Release notes for v${TARGET_VERSION}" \
+      --template .github/pull_request_template.md
+    ```
+
+    After creation, retrieve the rendered PR body and verify that it retains
+    the template's visible headings and contribution checkboxes.
 
 ## Validate
 
