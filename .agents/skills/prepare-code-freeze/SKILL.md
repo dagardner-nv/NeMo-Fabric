@@ -33,7 +33,7 @@ Assume `upstream` is the NVIDIA repository remote (`NVIDIA/NeMo-Fabric`) and
    If the remote release branch already exists, verify it points where expected
    before continuing.
 4. Create a PR branch from latest `upstream/main`, for example
-   `docs/code-freeze-<major>.<minor>`.
+   `chore/version-bump-<major>.<minor>`.
 5. Run `just set-version <next-version>` to bump all release-versioned package
    surfaces on `main`.
 6. Search documentation source for references to the old version and update
