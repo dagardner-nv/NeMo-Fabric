@@ -43,7 +43,6 @@ pypi_deployment_status() {
     local body=""
     local status=""
 
-    sleep 0.1
     response="$(
         curl --location --silent --show-error \
             --header 'Accept: application/vnd.pypi.simple.v1+json' \
@@ -230,7 +229,7 @@ if [[ "$check_node_packages" == true ]]; then
             "$package_name" \
             "$node_version" \
             "https://registry.npmjs.org/${package_name}/${node_version}"
-    done < <(git ls-files | grep package.json | grep -v docs/ || true)
+    done < <(git ls-files | grep package.json | grep -v docs/ | grep -v adapters/typescript/package.json || true)
 else
     printf '| Node.js | — | — | skipped: %s |\n' "$node_skip_reason"
 fi
