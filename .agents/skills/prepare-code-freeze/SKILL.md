@@ -69,6 +69,7 @@ Assume `upstream` is the NVIDIA repository remote (`NVIDIA/NeMo-Fabric`) and
    - the `just set-version <next-version>` bump
    - documentation old-version reference updates or intentional leftovers
    - that release-bound PRs now target the new `release/*` branch
+   - PR title should be: `chore: bump development version to <next-version>`
 9. After the code-freeze workflow completes successfully, invoke
    `create-rc-tag` with the target release version from step 1 and `RC_NUM=1`.
    The version must correspond to `release/<major>.<minor>` (for example,
