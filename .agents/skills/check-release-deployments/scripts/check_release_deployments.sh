@@ -43,6 +43,7 @@ pypi_deployment_status() {
     local body=""
     local status=""
 
+    sleep 0.1
     response="$(
         curl --location --silent --show-error \
             --header 'Accept: application/vnd.pypi.simple.v1+json' \
@@ -138,6 +139,9 @@ print_github_release_pipeline() {
 
     while IFS= read -r run; do
         workflow="$(jq -r '.workflowName' <<<"$run")"
+        if [[ "$workflow" == 'Request NVSkills CI' ]]; then
+            continue
+        fi
         run_id="$(jq -r '.databaseId' <<<"$run")"
         run_status="$(jq -r '.status' <<<"$run")"
         conclusion="$(jq -r '.conclusion // empty' <<<"$run")"

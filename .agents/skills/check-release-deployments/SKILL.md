@@ -17,8 +17,8 @@ bash .agents/skills/check-release-deployments/scripts/check_release_deployments.
 
 The checker converts the tag independently for Cargo, Python, and Node.js;
 discovers the tracked package manifests in their respective source trees; and
-reports every matching, tag-triggered GitHub Actions workflow before the
-package deployment table. If the `Publish Rust crates`, `Python`, or `Publish
+reports every matching, tag-triggered GitHub Actions release workflow, except
+`Request NVSkills CI`, before the package deployment table. If the `Publish Rust crates`, `Python`, or `Publish
 TypeScript package` workflow concludes with `failure`, the corresponding Cargo,
 Python, or Node.js registry checks are skipped and the table states why. For
 Python packages, it uses PyPI's JSON Index API at
