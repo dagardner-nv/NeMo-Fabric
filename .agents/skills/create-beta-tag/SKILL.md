@@ -78,8 +78,37 @@ out commit to equal the selected upstream branch. This also verifies the local
 package version when tagging from a release branch, and re-verifies the
 `upstream/main` version condition after switching to `main`.
 
+Run the remaining commands in one noninteractive Bash session. Record the
+user's original checkout and install this exit trap before switching branches.
+The trap returns to the original named branch (or detached commit) after a
+successful tag or any error, but only if this workflow changed the checkout.
+
 ```bash
-git switch "${TAG_SOURCE_BRANCH}"
+set -euo pipefail
+ORIGINAL_BRANCH="$(git branch --show-current)"
+ORIGINAL_HEAD="$(git rev-parse --verify HEAD)"
+CHECKOUT_CHANGED=false
+
+restore_checkout() {
+  local outcome=$?
+  trap - EXIT
+  if [[ "${CHECKOUT_CHANGED}" == true ]]; then
+    if [[ -n "${ORIGINAL_BRANCH}" ]]; then
+      git switch "${ORIGINAL_BRANCH}" || outcome=1
+    else
+      git switch --detach "${ORIGINAL_HEAD}" || outcome=1
+    fi
+  fi
+  exit "${outcome}"
+}
+trap restore_checkout EXIT
+```
+
+```bash
+if [[ "${ORIGINAL_BRANCH}" != "${TAG_SOURCE_BRANCH}" ]]; then
+  git switch "${TAG_SOURCE_BRANCH}"
+  CHECKOUT_CHANGED=true
+fi
 git pull --ff-only upstream "${TAG_SOURCE_BRANCH}"
 
 test -z "$(git status --porcelain)"

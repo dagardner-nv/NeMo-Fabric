@@ -67,8 +67,37 @@ not stash, discard, or switch away from a dirty worktree. The preceding remote
 branch check must succeed before switching to the release branch. Require its
 checked-out commit to equal the upstream branch before tagging:
 
+Run the remaining commands in one noninteractive Bash session. Record the
+user's original checkout and install this exit trap before switching branches.
+The trap returns to the original named branch (or detached commit) after a
+successful tag or any error, but only if this workflow changed the checkout.
+
 ```bash
-git switch "${RELEASE_BRANCH}"
+set -euo pipefail
+ORIGINAL_BRANCH="$(git branch --show-current)"
+ORIGINAL_HEAD="$(git rev-parse --verify HEAD)"
+CHECKOUT_CHANGED=false
+
+restore_checkout() {
+  local outcome=$?
+  trap - EXIT
+  if [[ "${CHECKOUT_CHANGED}" == true ]]; then
+    if [[ -n "${ORIGINAL_BRANCH}" ]]; then
+      git switch "${ORIGINAL_BRANCH}" || outcome=1
+    else
+      git switch --detach "${ORIGINAL_HEAD}" || outcome=1
+    fi
+  fi
+  exit "${outcome}"
+}
+trap restore_checkout EXIT
+```
+
+```bash
+if [[ "${ORIGINAL_BRANCH}" != "${RELEASE_BRANCH}" ]]; then
+  git switch "${RELEASE_BRANCH}"
+  CHECKOUT_CHANGED=true
+fi
 git pull --ff-only upstream "${RELEASE_BRANCH}"
 
 test -z "$(git status --porcelain)"
