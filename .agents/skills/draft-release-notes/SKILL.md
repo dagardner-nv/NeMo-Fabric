@@ -108,21 +108,14 @@ not publication-ready copy.
     ```bash
     git add docs/about-nemo-fabric/release-notes.mdx
     git commit -sm "Drafting release notes for v${TARGET_VERSION}"
-    ```
-12. Open a pull request from the release-notes branch to `${RELEASE_BRANCH}`.
-    Push to the upstream repository, use the repository PR template, and set
-    the title to `docs: Release notes for v${TARGET_VERSION}`:
-
-    ```bash
     git push -u upstream HEAD
-    gh pr create \
-      --base "${RELEASE_BRANCH}" \
-      --title "docs: Release notes for v${TARGET_VERSION}" \
-      --template .github/pull_request_template.md
     ```
+12. Use the `prepare-pr` skill to open a pull request from the release-notes
+    branch to `${RELEASE_BRANCH}`. Use this title:
 
-    After creation, retrieve the rendered PR body and verify that it retains
-    the template's visible headings and contribution checkboxes.
+    ```text
+    docs: Release notes for v${TARGET_VERSION}
+    ```
 
 ## Validate
 
