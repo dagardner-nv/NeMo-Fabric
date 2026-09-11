@@ -459,6 +459,14 @@ lock-python:
 normalize-release-tag tag:
     @uv run --no-project --no-cache python scripts/ci/normalize_release_tag.py {{ quote(tag) }}
 
+# Convert a release tag to the PEP 440 version used by Python package metadata.
+release-tag-to-py-version tag:
+    #!/usr/bin/env bash
+    {{ bash_helpers }}
+    tag={{ quote(tag) }}
+    tag="$(just normalize-release-tag "$tag")"
+    semver_to_pep440 "$tag"
+
 # Apply a release version only to Cargo workspace metadata and Cargo.lock.
 # Tag publication uses this narrow recipe in a disposable checkout.
 set-cargo-version version="":
